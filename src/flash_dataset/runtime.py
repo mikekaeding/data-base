@@ -288,13 +288,18 @@ def run_scheduled(
     validate_runtime_config(config)
     _load_runtime_state(config)
     now_provider = _utc_now if now_provider is None else now_provider
+    next_run = datetime.combine(
+        _as_utc(now_provider()).date(), config.run_at, tzinfo=UTC
+    )
     while True:
         now = _as_utc(now_provider())
-        scheduled_run = next_scheduled_run(now, config.run_at)
-        sleep_seconds = (scheduled_run - now).total_seconds()
+        sleep_seconds = (next_run - now).total_seconds()
         if sleep_seconds > 0:
             sleep(sleep_seconds)
         emit_summary(run_once(config, run_time=now_provider()))
+        next_run = datetime.combine(
+            next_run.date() + timedelta(days=1), config.run_at, tzinfo=UTC
+        )
 
 
 def _finalize_run_outputs(

@@ -373,8 +373,7 @@ class RuntimeTests(unittest.TestCase):
             working_directory = Path(directory) / "runtime"
             write_day_tables(root, date(2026, 4, 5), layout="hour")
             project_root = Path(__file__).resolve().parents[1]
-            script = textwrap.dedent(
-                f"""
+            script = textwrap.dedent(f"""
                 import os
                 import signal
                 from pathlib import Path
@@ -397,8 +396,7 @@ class RuntimeTests(unittest.TestCase):
                             max_days_back=0,
                         )
                     )
-                """
-            )
+                """)
 
             completed = subprocess.run(
                 [sys.executable, "-c", script],
@@ -426,8 +424,7 @@ class RuntimeTests(unittest.TestCase):
             )
             write_day_tables(root, date(2026, 4, 6), layout="hour")
             project_root = Path(__file__).resolve().parents[1]
-            script = textwrap.dedent(
-                f"""
+            script = textwrap.dedent(f"""
                 import os
                 import signal
                 from pathlib import Path
@@ -450,8 +447,7 @@ class RuntimeTests(unittest.TestCase):
                             max_days_back=0,
                         )
                     )
-                """
-            )
+                """)
 
             completed = subprocess.run(
                 [sys.executable, "-c", script],
@@ -994,6 +990,51 @@ class RuntimeTests(unittest.TestCase):
                     now_provider=lambda: datetime(2026, 4, 13, 5, 0, tzinfo=UTC),
                 )
             self.assertEqual(sleep_calls, [])
+
+    def test_run_scheduled_runs_immediately_when_started_after_today_slot(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "storage"
+            working_directory = Path(directory) / "runtime"
+            write_day_tables(root, date(2026, 4, 5), layout="hour")
+            started_at = datetime(2026, 4, 13, 7, 0, tzinfo=UTC)
+            provided_times = iter([started_at, started_at, started_at])
+            sleep_calls: list[float] = []
+            emitted_summaries: list[object] = []
+            run_once_times: list[datetime | None] = []
+
+            def record_sleep(seconds: float) -> None:
+                sleep_calls.append(seconds)
+
+            def now_provider() -> datetime:
+                return next(provided_times)
+
+            def record_summary(summary: object) -> None:
+                emitted_summaries.append(summary)
+                raise StopIteration
+
+            def fake_run_once(
+                config: RuntimeConfig, run_time: datetime | None = None
+            ) -> object:
+                self.assertEqual(config.working_directory, working_directory)
+                self.assertEqual(config.storage_directory, root)
+                run_once_times.append(run_time)
+                return {"status": "validated"}
+
+            with patch("flash_dataset.runtime.run_once", side_effect=fake_run_once):
+                with self.assertRaises(StopIteration):
+                    run_scheduled(
+                        RuntimeConfig(
+                            working_directory=working_directory,
+                            storage_directory=root,
+                        ),
+                        emit_summary=record_summary,
+                        sleep=record_sleep,
+                        now_provider=now_provider,
+                    )
+
+            self.assertEqual(sleep_calls, [])
+            self.assertEqual(run_once_times, [started_at])
+            self.assertEqual(emitted_summaries, [{"status": "validated"}])
 
 
 if __name__ == "__main__":

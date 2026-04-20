@@ -163,6 +163,8 @@ Override `command:` only if you need non-default paths or schedule. Use `run-dai
 when you want a one-shot incremental execution, or `validate-parquet` for a direct validator run.
 The container runs as an unprivileged user, so the host path behind `/data/working` must be
 writable by that UID.
+When scheduled mode starts after the configured UTC slot, it immediately runs one catch-up pass
+before sleeping until the next day instead of idling until tomorrow.
 
 ## Build And Upload
 

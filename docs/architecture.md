@@ -77,6 +77,8 @@ at a time.
   publishing dangling symlinks, and any later dangling state link is treated as corruption.
 - Scheduled mode validates the same persisted watermark state before its first sleep, so corrupted
   runtime state fails fast at startup rather than waiting until the next run slot.
+- After startup validation, the first scheduled pass anchors to today's configured UTC slot. If the
+  process starts after that slot, it runs immediately once and then resumes normal daily sleeps.
 - Physical parquet footer schema must match the `feed-base` writer exactly.
 - `flashblocks` is the parent table keyed by `(payload_id, index)`.
 - Every child dataset row must map to an existing parent flashblock.

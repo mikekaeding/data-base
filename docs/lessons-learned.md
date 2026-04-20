@@ -38,6 +38,9 @@
   runtime state instead of silently bootstrapping from scratch.
 - Scheduled mode should validate persisted runtime state before its first sleep, not only before
   the first actual run, or operators will not see broken state until the next slot arrives.
+- Scheduled mode should anchor its first pass to today's configured UTC slot instead of the next
+  future slot. Otherwise a restart after the daily time can idle for nearly a day even when work is
+  already available.
 - Large storage scans do not need full-history review on every run. A small day window relative to
   the newest discovered folder bounds startup cost while keeping recent incremental review simple.
 - Date-window pruning must only skip valid out-of-range directories. If you prune malformed layout

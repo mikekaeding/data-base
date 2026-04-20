@@ -5,6 +5,8 @@
 - Discover candidate work from top-level `year/month/day` folders before touching parquet files.
 - Fail scheduled runtime startup fast when the storage root does not expose that `year/month/day`
   layout, instead of sleeping first and surfacing the problem only at the next run slot.
+- If the process restarts after the configured UTC slot, run the pending daily pass immediately
+  instead of idling until tomorrow and stretching backlog latency by almost a full day.
 - Skip days at or before the stored watermark without opening their parquet data.
 - Bound the candidate scan to the newest discovered day and ignore folders older than
   `max_days_back` relative to that newest day.
