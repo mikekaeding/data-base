@@ -46,9 +46,9 @@
 - Date-window pruning must only skip valid out-of-range directories. If you prune malformed layout
   roots too early, filtered runs hide `partition_parse_error` findings and misreport the run as
   `no_matching_parquet_files`.
-- Baselines do not need a separate database to be useful. A single validation run can still detect
-  meaningful drift by comparing each partition against other comparable partitions discovered under
-  the same storage root.
+- Baselines do not need a separate database to be useful. Compact committed snapshots alongside the
+  runtime watermark are enough to preserve day-by-day drift checks without reopening older
+  partitions for full validation.
 - `pyarrow` remains a weakly typed dependency from a static-analysis perspective. Keep its dynamic
   compute calls behind narrow wrappers, and prefer small repo-local stubs for the Arrow surface you
   actually use over weakening strict type checks in the validator modules.

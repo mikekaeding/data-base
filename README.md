@@ -1,8 +1,8 @@
 # data-base
 
 `data-base` is a container-friendly validator for `feed-base` parquet output. It scans one
-`year=YYYY/month=MM/day=DD` storage directory, validates only recent unseen day partitions, and
-writes one report per run.
+`year=YYYY/month=MM/day=DD` storage directory, validates recent unseen day partitions one day at a
+time, and writes one report per run.
 
 The validator checks:
 - exact physical parquet schema per dataset
@@ -13,8 +13,9 @@ The validator checks:
 - logical-key uniqueness and ordinal contiguity
 - transaction-type, receipt-status, topic-count, base-field, and authorization field contracts
 - per-partition physical parquet stats and logical-distribution baselines
-- same-run drift checks for payload lengths, tail-only payload volume, dataset physical stats,
-  and transaction-type mix when enough comparison partitions are present
+- drift checks for payload lengths, tail-only payload volume, dataset physical stats, and
+  transaction-type mix when enough same-hour comparison partitions are available inside the active
+  review window
 - optional `keccak(transaction_rlp) == transaction_hash` verification for every stored transaction row
 
 ## Commands
@@ -25,7 +26,7 @@ The CLI exposes two commands:
   One direct validator run over one optional date range.
 - `flash-dataset run-daily`
   The long-lived UTC scheduler for unseen day folders. Set `--run-at off` to execute one
-  incremental pass and exit.
+  single-day incremental pass and exit.
 
 ## `run-daily` Parameters
 
@@ -79,8 +80,11 @@ uv run flash-dataset run-daily \
 Each `run-daily` pass prints one compact JSON summary to stdout and writes:
 - `reports/YYYY-MM-DDTHH-MM-SSZ[-NN]/summary.md`
 - `reports/YYYY-MM-DDTHH-MM-SSZ[-NN]/findings.jsonl`
+- `reports/YYYY-MM-DDTHH-MM-SSZ[-NN]/baseline-snapshots.json` after the runtime establishes the
+  first persisted watermark
 - `reports/latest/summary.md`
 - `reports/latest/findings.jsonl`
+- `baseline-snapshots.json` after the runtime establishes the first persisted watermark
 - `latest-reviewed.txt` after the runtime establishes the first contiguous day watermark
 
 under `--working-directory`. The `validate-parquet` command writes reports to
@@ -88,10 +92,10 @@ under `--working-directory`. The `validate-parquet` command writes reports to
 For `run-daily`, `summary.md` is the runtime-owned run summary, including runtime status and
 validator finding counts. `findings.jsonl` remains the raw validator finding stream for that run.
 
-If no newer day folders exist, the program writes a no-op report and exits successfully. If a run
-stops because a missing or empty earlier day still blocks newer work, the program reports
-`status=blocked`; the one-shot `run-daily --run-at off` path exits non-zero until that earlier day
-is available, even if the same pass validated earlier contiguous days first.
+If no newer day folders exist, the program writes a no-op report and exits successfully. Scheduled
+mode keeps running one-day passes until it reaches `idle` or `blocked`. The one-shot
+`run-daily --run-at off` path reports only the next expected day: it exits non-zero when that day
+is missing, empty, or has non-metric findings.
 
 ## Watermark Rules
 
@@ -100,28 +104,30 @@ is available, even if the same pass validated earlier contiguous days first.
   That file does not exist until the runtime establishes the first persisted watermark.
 - The runtime ignores day folders more than `--max-days-back` days older than the newest
   discovered folder.
-- A run only validates the contiguous calendar prefix of later day folders that already exist and
-  contain parquet files.
+- Each runtime pass validates only the next expected day inside the active review window.
+- Scheduled mode keeps invoking those single-day passes until there are no more unseen eligible
+  days in the window or the next expected day is blocked.
 - The watermark stops before the first missing or empty pending day so a later day cannot advance
   past an earlier gap.
-- A one-shot runtime pass reports `blocked` when newer day folders exist but the next expected day
-  is still missing or empty, or when the earliest selected day has any non-metric findings,
-  even if another partition in that same day reviewed successfully or the same run validated
-  earlier days first.
+- A one-shot runtime pass reports `blocked` when the next expected day is missing, empty, or has
+  any non-metric findings, even if another partition in that same day reviewed successfully.
 - On a fresh working directory, the runtime establishes the first watermark only after the
-  contiguous reviewed run reaches the oldest day inside the current review window.
+  selected day reaches the oldest day inside the current review window.
 - The runtime refuses an unreadable `latest-reviewed.txt`, unreadable storage folders, or a stored
   watermark newer than the newest discovered day folder as configuration errors. A dangling
   `latest-reviewed.txt` symlink is treated as corrupted runtime state, not as a fresh bootstrap.
   Scheduled mode validates that runtime state before its first sleep, so a bad watermark fails
   fast at startup.
+- The runtime also persists compact committed baseline snapshots beside the watermark so one-day
+  runs can still compare the current day against prior healthy same-hour peers inside the active
+  review window.
 - The runtime also refuses any storage tree that is not strict top-level
   `year=YYYY/month=MM/day=DD`, including validator-only `date=...`, dataset-first, unknown
   top-level roots, unsupported top-level files, and malformed runtime partition directories,
   instead of misreporting them as idle.
-- The watermark advances only when that validator run finishes without fail findings, the day being
-  stored produced at least one reviewed validator partition and no non-metric findings across the
-  day, and the runtime successfully promotes that run through the stable
+- The watermark advances only when that single-day validator run finishes without fail findings, the
+  day being stored produced at least one reviewed validator partition and no non-metric findings
+  across the day, and the runtime successfully promotes that run through the stable
   `reports/latest/current -> reports/<run>/` pointer. The top-level `latest-reviewed.txt` resolves
   through that same pointer, so the committed latest report and committed watermark move together.
 

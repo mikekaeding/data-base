@@ -14,15 +14,21 @@ import os
 from pathlib import Path
 import time as time_module
 from typing import Literal
+from typing import cast
 
 from .errors import ValidatorConfigurationError
 from .validator import ValidatorConfig
 from .validator import run_validation
+from .validator.baselines import DatasetPhysicalSnapshot
+from .validator.baselines import DistributionSummary
+from .validator.baselines import PartitionSnapshot
 from .validator.common import Finding
+from .validator.common import PartitionIdentity
 from .validator.discovery import validate_writable_directory_target
 
 RUN_DIRECTORY_FORMAT = "%Y-%m-%dT%H-%M-%SZ"
 STATE_FILE_NAME = "latest-reviewed.txt"
+BASELINE_SNAPSHOTS_FILE_NAME = "baseline-snapshots.json"
 SUMMARY_FILE_NAME = "summary.md"
 FINDINGS_FILE_NAME = "findings.jsonl"
 LATEST_POINTER_NAME = "current"
@@ -175,17 +181,28 @@ def run_once(config: RuntimeConfig, run_time: datetime | None = None) -> RunSumm
     """Run one incremental validation pass and update persisted state on completion."""
     validate_runtime_config(config)
     run_time = _utc_now() if run_time is None else _as_utc(run_time)
-    state_path, stored_watermark, discovered_days = _load_runtime_state(config)
+    (
+        state_path,
+        baseline_snapshots_path,
+        stored_watermark,
+        committed_snapshots,
+        discovered_days,
+    ) = _load_runtime_state(config)
     oldest_allowed_day = _oldest_allowed_day(discovered_days, config.max_days_back)
     pending_days = _select_pending_days(
         discovered_days, stored_watermark, oldest_allowed_day
     )
-    reviewable_days, blocked_day = _select_contiguous_reviewable_days(
+    target_day, blocked_day = _select_next_reviewable_day(
         pending_days, stored_watermark, oldest_allowed_day
+    )
+    persisted_snapshots = _pruned_committed_snapshots(
+        committed_snapshots,
+        oldest_allowed_day,
+        stored_watermark,
     )
 
     report_directory = _build_report_directory(config.working_directory, run_time)
-    if not reviewable_days:
+    if target_day is None:
         status = "blocked" if blocked_day is not None else "idle"
         summary = RunSummary(
             status=status,
@@ -210,7 +227,9 @@ def run_once(config: RuntimeConfig, run_time: datetime | None = None) -> RunSumm
             summary,
             latest_directory=config.working_directory / "reports" / "latest",
             state_path=state_path,
+            baseline_snapshots_path=baseline_snapshots_path,
             persisted_watermark=stored_watermark,
+            persisted_snapshots=persisted_snapshots,
             status_text=_runtime_status_text(
                 summary.status, blocked_by_pending_day=blocked_day is not None
             ),
@@ -218,32 +237,45 @@ def run_once(config: RuntimeConfig, run_time: datetime | None = None) -> RunSumm
         )
         return summary
 
-    date_from = reviewable_days[0].partition_date
-    date_to = reviewable_days[-1].partition_date
     blocked_by_pending_day = blocked_day is not None
     result = run_validation(
         ValidatorConfig(
             storage_root=config.storage_directory,
             output_directory=report_directory,
-            date_from=date_from,
-            date_to=date_to,
+            date_from=target_day.partition_date,
+            date_to=target_day.partition_date,
             verify_transaction_hashes=config.verify_transaction_hashes,
-        )
+        ),
+        comparison_snapshots=_comparison_snapshots_for_target_day(
+            persisted_snapshots,
+            oldest_allowed_day,
+            target_day.partition_date,
+        ),
     )
     counts = result.finding_counts_by_status()
     reviewed_partition_dates = _reviewed_partition_dates(result.reviewed_partitions)
     issue_dates = _issue_dates(result.findings, config.storage_directory)
     reviewed_watermark_days = _contiguous_reviewed_days(
-        reviewable_days, reviewed_partition_dates, issue_dates
+        [target_day],
+        reviewed_partition_dates,
+        issue_dates,
     )
     blocked_day = _blocked_day_after_validation(
-        reviewable_days, reviewed_watermark_days, blocked_day
+        [target_day],
+        reviewed_watermark_days,
+        blocked_day,
     )
     persisted_watermark = stored_watermark
     if not result.has_failures() and _should_store_latest_reviewed_day(
         stored_watermark, reviewed_watermark_days, oldest_allowed_day
     ):
         persisted_watermark = reviewed_watermark_days[-1].partition_date
+        persisted_snapshots = _next_committed_snapshots(
+            persisted_snapshots,
+            result.partition_snapshots,
+            oldest_allowed_day,
+            persisted_watermark,
+        )
     summary = RunSummary(
         status="blocked" if blocked_day is not None else "validated",
         working_directory=str(config.working_directory),
@@ -267,7 +299,9 @@ def run_once(config: RuntimeConfig, run_time: datetime | None = None) -> RunSumm
         summary,
         latest_directory=config.working_directory / "reports" / "latest",
         state_path=state_path,
+        baseline_snapshots_path=baseline_snapshots_path,
         persisted_watermark=persisted_watermark,
+        persisted_snapshots=persisted_snapshots,
         status_text=_runtime_status_text(
             summary.status, blocked_by_pending_day=blocked_by_pending_day
         ),
@@ -296,7 +330,11 @@ def run_scheduled(
         sleep_seconds = (next_run - now).total_seconds()
         if sleep_seconds > 0:
             sleep(sleep_seconds)
-        emit_summary(run_once(config, run_time=now_provider()))
+        while True:
+            summary = run_once(config, run_time=now_provider())
+            emit_summary(summary)
+            if summary.status != "validated":
+                break
         next_run = datetime.combine(
             next_run.date() + timedelta(days=1), config.run_at, tzinfo=UTC
         )
@@ -306,7 +344,9 @@ def _finalize_run_outputs(
     summary: RunSummary,
     latest_directory: Path,
     state_path: Path,
+    baseline_snapshots_path: Path,
     persisted_watermark: date | None,
+    persisted_snapshots: list[PartitionSnapshot],
     status_text: str,
     write_empty_findings: bool,
 ) -> None:
@@ -316,18 +356,23 @@ def _finalize_run_outputs(
         write_empty_findings=write_empty_findings,
     )
     report_directory = Path(summary.report_directory)
-    _write_report_state_file(report_directory, persisted_watermark)
+    _write_report_state_files(
+        report_directory,
+        persisted_watermark,
+        persisted_snapshots,
+    )
     _promote_latest_report(
         report_directory,
         latest_directory,
         state_path,
+        baseline_snapshots_path,
         has_persisted_watermark=persisted_watermark is not None,
     )
 
 
 def _load_runtime_state(
     config: RuntimeConfig,
-) -> tuple[Path, date | None, list[DayPartition]]:
+) -> tuple[Path, Path, date | None, list[PartitionSnapshot], list[DayPartition]]:
     try:
         config.working_directory.mkdir(parents=True, exist_ok=True)
     except OSError as error:
@@ -335,10 +380,23 @@ def _load_runtime_state(
             f"working directory is not writable: {config.working_directory}"
         ) from error
     state_path = config.working_directory / STATE_FILE_NAME
+    baseline_snapshots_path = config.working_directory / BASELINE_SNAPSHOTS_FILE_NAME
     stored_watermark = load_latest_reviewed_day(state_path)
+    committed_snapshots = _load_committed_baseline_snapshots(baseline_snapshots_path)
     discovered_days = discover_day_partitions(config.storage_directory)
     _validate_stored_watermark(state_path, stored_watermark, discovered_days)
-    return state_path, stored_watermark, discovered_days
+    _validate_committed_snapshots(
+        baseline_snapshots_path,
+        stored_watermark,
+        committed_snapshots,
+    )
+    return (
+        state_path,
+        baseline_snapshots_path,
+        stored_watermark,
+        committed_snapshots,
+        discovered_days,
+    )
 
 
 def load_latest_reviewed_day(state_path: Path) -> date | None:
@@ -378,6 +436,266 @@ def store_latest_reviewed_day(state_path: Path, latest_reviewed_day: date) -> No
         raise ValidatorConfigurationError(
             f"failed to write latest reviewed day: {state_path}"
         ) from error
+
+
+def _load_committed_baseline_snapshots(
+    baseline_snapshots_path: Path,
+) -> list[PartitionSnapshot]:
+    try:
+        raw_value = baseline_snapshots_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        if baseline_snapshots_path.is_symlink():
+            raise ValidatorConfigurationError(
+                "committed baseline snapshots are a dangling symlink: "
+                f"{baseline_snapshots_path}"
+            ) from None
+        return []
+    except OSError as error:
+        raise ValidatorConfigurationError(
+            f"failed to read committed baseline snapshots: {baseline_snapshots_path}"
+        ) from error
+    if raw_value == "":
+        return []
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise ValidatorConfigurationError(
+            f"invalid committed baseline snapshots in {baseline_snapshots_path}"
+        ) from error
+    if not isinstance(payload, list):
+        raise ValidatorConfigurationError(
+            f"invalid committed baseline snapshots in {baseline_snapshots_path}"
+        )
+    payload_list = cast(list[object], payload)
+    try:
+        snapshots = [_partition_snapshot_from_payload(item) for item in payload_list]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValidatorConfigurationError(
+            f"invalid committed baseline snapshots in {baseline_snapshots_path}"
+        ) from error
+    return sorted(snapshots, key=lambda snapshot: snapshot.partition)
+
+
+def _store_committed_baseline_snapshots(
+    baseline_snapshots_path: Path,
+    committed_snapshots: list[PartitionSnapshot],
+) -> None:
+    try:
+        baseline_snapshots_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = baseline_snapshots_path.with_name(
+            f"{baseline_snapshots_path.name}.tmp"
+        )
+        payload = [
+            _partition_snapshot_payload(snapshot)
+            for snapshot in sorted(
+                committed_snapshots,
+                key=lambda snapshot: snapshot.partition,
+            )
+        ]
+        temporary_path.write_text(
+            f"{json.dumps(payload, sort_keys=True)}\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(baseline_snapshots_path)
+    except OSError as error:
+        raise ValidatorConfigurationError(
+            f"failed to write committed baseline snapshots: {baseline_snapshots_path}"
+        ) from error
+
+
+def _partition_snapshot_payload(snapshot: PartitionSnapshot) -> dict[str, object]:
+    return {
+        "partition_date": snapshot.partition.partition_date.isoformat(),
+        "partition_hour": snapshot.partition.partition_hour,
+        "dataset_snapshots": [
+            _dataset_physical_snapshot_payload(dataset_snapshot)
+            for dataset_snapshot in snapshot.dataset_snapshots
+        ],
+        "empty_datasets": list(snapshot.empty_datasets),
+        "payload_lengths": list(snapshot.payload_lengths),
+        "payload_length_summary": _distribution_summary_payload(
+            snapshot.payload_length_summary
+        ),
+        "tail_only_payload_count": snapshot.tail_only_payload_count,
+        "transaction_count_summary": _distribution_summary_payload(
+            snapshot.transaction_count_summary
+        ),
+        "receipt_log_count_summary": _distribution_summary_payload(
+            snapshot.receipt_log_count_summary
+        ),
+        "balance_change_count_summary": _distribution_summary_payload(
+            snapshot.balance_change_count_summary
+        ),
+        "withdrawal_count_summary": _distribution_summary_payload(
+            snapshot.withdrawal_count_summary
+        ),
+        "transaction_type_counts": [
+            {"label": label, "count": count}
+            for label, count in snapshot.transaction_type_counts
+        ],
+        "total_transactions": snapshot.total_transactions,
+        "peer_eligible": snapshot.peer_eligible,
+    }
+
+
+def _dataset_physical_snapshot_payload(
+    dataset_snapshot: DatasetPhysicalSnapshot,
+) -> dict[str, object]:
+    return {
+        "dataset": dataset_snapshot.dataset,
+        "row_count": dataset_snapshot.row_count,
+        "file_size_bytes": dataset_snapshot.file_size_bytes,
+        "row_groups": dataset_snapshot.row_groups,
+        "compressed_bytes": dataset_snapshot.compressed_bytes,
+        "uncompressed_bytes": dataset_snapshot.uncompressed_bytes,
+    }
+
+
+def _distribution_summary_payload(summary: DistributionSummary) -> dict[str, object]:
+    return {
+        "count": summary.count,
+        "minimum": summary.minimum,
+        "median_value": summary.median_value,
+        "maximum": summary.maximum,
+    }
+
+
+def _partition_snapshot_from_payload(payload: object) -> PartitionSnapshot:
+    payload_map = _payload_mapping(payload)
+    return PartitionSnapshot(
+        partition=PartitionIdentity(
+            partition_date=date.fromisoformat(
+                _payload_string(payload_map, "partition_date")
+            ),
+            partition_hour=_payload_optional_int(payload_map, "partition_hour"),
+        ),
+        dataset_snapshots=tuple(
+            _dataset_physical_snapshot_from_payload(item)
+            for item in _payload_list(payload_map, "dataset_snapshots")
+        ),
+        empty_datasets=tuple(_payload_string_list(payload_map, "empty_datasets")),
+        payload_lengths=tuple(_payload_int_list(payload_map, "payload_lengths")),
+        payload_length_summary=_distribution_summary_from_payload(
+            _payload_value(payload_map, "payload_length_summary")
+        ),
+        tail_only_payload_count=_payload_int(payload_map, "tail_only_payload_count"),
+        transaction_count_summary=_distribution_summary_from_payload(
+            _payload_value(payload_map, "transaction_count_summary")
+        ),
+        receipt_log_count_summary=_distribution_summary_from_payload(
+            _payload_value(payload_map, "receipt_log_count_summary")
+        ),
+        balance_change_count_summary=_distribution_summary_from_payload(
+            _payload_value(payload_map, "balance_change_count_summary")
+        ),
+        withdrawal_count_summary=_distribution_summary_from_payload(
+            _payload_value(payload_map, "withdrawal_count_summary")
+        ),
+        transaction_type_counts=tuple(
+            _transaction_type_count_from_payload(item)
+            for item in _payload_list(payload_map, "transaction_type_counts")
+        ),
+        total_transactions=_payload_int(payload_map, "total_transactions"),
+        peer_eligible=_payload_bool(payload_map, "peer_eligible"),
+    )
+
+
+def _dataset_physical_snapshot_from_payload(
+    payload: object,
+) -> DatasetPhysicalSnapshot:
+    payload_map = _payload_mapping(payload)
+    return DatasetPhysicalSnapshot(
+        dataset=_payload_string(payload_map, "dataset"),
+        row_count=_payload_int(payload_map, "row_count"),
+        file_size_bytes=_payload_int(payload_map, "file_size_bytes"),
+        row_groups=_payload_int(payload_map, "row_groups"),
+        compressed_bytes=_payload_int(payload_map, "compressed_bytes"),
+        uncompressed_bytes=_payload_int(payload_map, "uncompressed_bytes"),
+    )
+
+
+def _distribution_summary_from_payload(payload: object) -> DistributionSummary:
+    payload_map = _payload_mapping(payload)
+    return DistributionSummary(
+        count=_payload_int(payload_map, "count"),
+        minimum=_payload_optional_int(payload_map, "minimum"),
+        median_value=_payload_optional_float(payload_map, "median_value"),
+        maximum=_payload_optional_int(payload_map, "maximum"),
+    )
+
+
+def _transaction_type_count_from_payload(payload: object) -> tuple[str, int]:
+    payload_map = _payload_mapping(payload)
+    return (
+        _payload_string(payload_map, "label"),
+        _payload_int(payload_map, "count"),
+    )
+
+
+def _payload_mapping(payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise TypeError("expected mapping payload")
+    return cast(dict[str, object], payload)
+
+
+def _payload_value(payload: dict[str, object], key: str) -> object:
+    return payload[key]
+
+
+def _payload_list(payload: dict[str, object], key: str) -> list[object]:
+    value = _payload_value(payload, key)
+    if not isinstance(value, list):
+        raise TypeError(f"expected list for {key}")
+    return cast(list[object], value)
+
+
+def _payload_string(payload: dict[str, object], key: str) -> str:
+    value = _payload_value(payload, key)
+    if not isinstance(value, str):
+        raise TypeError(f"expected string for {key}")
+    return value
+
+
+def _payload_string_list(payload: dict[str, object], key: str) -> list[str]:
+    values = _payload_list(payload, key)
+    return [_payload_string({"value": value}, "value") for value in values]
+
+
+def _payload_int(payload: dict[str, object], key: str) -> int:
+    value = _payload_value(payload, key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"expected int for {key}")
+    return value
+
+
+def _payload_int_list(payload: dict[str, object], key: str) -> list[int]:
+    values = _payload_list(payload, key)
+    return [_payload_int({"value": value}, "value") for value in values]
+
+
+def _payload_optional_int(payload: dict[str, object], key: str) -> int | None:
+    value = _payload_value(payload, key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"expected optional int for {key}")
+    return value
+
+
+def _payload_optional_float(payload: dict[str, object], key: str) -> float | None:
+    value = _payload_value(payload, key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"expected optional float for {key}")
+    return float(value)
+
+
+def _payload_bool(payload: dict[str, object], key: str) -> bool:
+    value = _payload_value(payload, key)
+    if not isinstance(value, bool):
+        raise TypeError(f"expected bool for {key}")
+    return value
 
 
 def validate_runtime_config(config: RuntimeConfig) -> None:
@@ -560,28 +878,98 @@ def _validate_stored_watermark(
         )
 
 
-def _select_contiguous_reviewable_days(
+def _validate_committed_snapshots(
+    baseline_snapshots_path: Path,
+    stored_watermark: date | None,
+    committed_snapshots: list[PartitionSnapshot],
+) -> None:
+    if stored_watermark is None:
+        if committed_snapshots:
+            raise ValidatorConfigurationError(
+                "committed baseline snapshots exist without a latest reviewed day: "
+                f"{baseline_snapshots_path}"
+            )
+        return
+    for snapshot in committed_snapshots:
+        if snapshot.partition.partition_date > stored_watermark:
+            raise ValidatorConfigurationError(
+                "committed baseline snapshot is after the latest reviewed day: "
+                f"{baseline_snapshots_path} -> {snapshot.partition.label()} > "
+                f"{stored_watermark.isoformat()}"
+            )
+
+
+def _select_next_reviewable_day(
     pending_days: list[DayPartition],
     stored_watermark: date | None,
     oldest_allowed_day: date | None,
-) -> tuple[list[DayPartition], date | None]:
-    """Return the contiguous reviewable prefix and the first day currently blocking progress."""
-    reviewable_days: list[DayPartition] = []
+) -> tuple[DayPartition | None, date | None]:
+    """Return the next reviewable day and the first day currently blocking progress."""
     if not pending_days:
-        return reviewable_days, None
+        return None, None
     expected_day = pending_days[0].partition_date
     if stored_watermark is not None:
         expected_day = stored_watermark + timedelta(days=1)
     if oldest_allowed_day is not None and expected_day < oldest_allowed_day:
         expected_day = oldest_allowed_day
-    for partition in pending_days:
-        if partition.partition_date != expected_day:
-            return reviewable_days, expected_day
-        if not _day_contains_parquet_files(partition):
-            return reviewable_days, expected_day
-        reviewable_days.append(partition)
-        expected_day = expected_day + timedelta(days=1)
-    return reviewable_days, None
+    first_pending_day = pending_days[0]
+    if first_pending_day.partition_date != expected_day:
+        return None, expected_day
+    if not _day_contains_parquet_files(first_pending_day):
+        return None, expected_day
+    return first_pending_day, None
+
+
+def _comparison_snapshots_for_target_day(
+    committed_snapshots: list[PartitionSnapshot],
+    oldest_allowed_day: date | None,
+    target_day: date,
+) -> tuple[PartitionSnapshot, ...]:
+    if oldest_allowed_day is None:
+        return ()
+    return tuple(
+        snapshot
+        for snapshot in committed_snapshots
+        if oldest_allowed_day <= snapshot.partition.partition_date < target_day
+    )
+
+
+def _pruned_committed_snapshots(
+    committed_snapshots: list[PartitionSnapshot],
+    oldest_allowed_day: date | None,
+    latest_reviewed_day: date | None,
+) -> list[PartitionSnapshot]:
+    if oldest_allowed_day is None or latest_reviewed_day is None:
+        return []
+    return sorted(
+        (
+            snapshot
+            for snapshot in committed_snapshots
+            if oldest_allowed_day
+            <= snapshot.partition.partition_date
+            <= latest_reviewed_day
+        ),
+        key=lambda snapshot: snapshot.partition,
+    )
+
+
+def _next_committed_snapshots(
+    committed_snapshots: list[PartitionSnapshot],
+    current_snapshots: list[PartitionSnapshot],
+    oldest_allowed_day: date | None,
+    latest_reviewed_day: date,
+) -> list[PartitionSnapshot]:
+    snapshot_by_label = {
+        snapshot.partition.label(): snapshot
+        for snapshot in _pruned_committed_snapshots(
+            committed_snapshots,
+            oldest_allowed_day,
+            latest_reviewed_day,
+        )
+    }
+    for snapshot in current_snapshots:
+        snapshot_by_label[snapshot.partition.label()] = snapshot
+    return sorted(snapshot_by_label.values(), key=lambda snapshot: snapshot.partition)
 
 
 def _reviewed_partition_dates(reviewed_partitions: list[str]) -> set[date]:
@@ -700,18 +1088,25 @@ def _parse_number_component(name: str, prefix: str) -> int | None:
     return int(value)
 
 
-def _write_report_state_file(
-    report_directory: Path, persisted_watermark: date | None
+def _write_report_state_files(
+    report_directory: Path,
+    persisted_watermark: date | None,
+    persisted_snapshots: list[PartitionSnapshot],
 ) -> None:
     if persisted_watermark is None:
         return
     store_latest_reviewed_day(report_directory / STATE_FILE_NAME, persisted_watermark)
+    _store_committed_baseline_snapshots(
+        report_directory / BASELINE_SNAPSHOTS_FILE_NAME,
+        persisted_snapshots,
+    )
 
 
 def _promote_latest_report(
     source_directory: Path,
     latest_directory: Path,
     state_path: Path,
+    baseline_snapshots_path: Path,
     has_persisted_watermark: bool,
 ) -> None:
     try:
@@ -730,12 +1125,22 @@ def _promote_latest_report(
                 Path(LATEST_POINTER_NAME) / STATE_FILE_NAME,
             )
             _replace_symlink(
+                latest_directory / BASELINE_SNAPSHOTS_FILE_NAME,
+                Path(LATEST_POINTER_NAME) / BASELINE_SNAPSHOTS_FILE_NAME,
+            )
+            _replace_symlink(
                 state_path,
                 Path("reports") / latest_directory.name / STATE_FILE_NAME,
             )
+            _replace_symlink(
+                baseline_snapshots_path,
+                Path("reports") / latest_directory.name / BASELINE_SNAPSHOTS_FILE_NAME,
+            )
         else:
             _remove_path_if_present(latest_directory / STATE_FILE_NAME)
+            _remove_path_if_present(latest_directory / BASELINE_SNAPSHOTS_FILE_NAME)
             _remove_path_if_present(state_path)
+            _remove_path_if_present(baseline_snapshots_path)
         _replace_symlink(
             latest_directory / LATEST_POINTER_NAME,
             Path("..") / source_directory.name,

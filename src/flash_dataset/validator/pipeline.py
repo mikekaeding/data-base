@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable
+from collections.abc import Sequence
 from datetime import date
 
 import pyarrow as pa
@@ -30,8 +31,9 @@ from .rules import make_finding
 def run_validation(
     config: ValidatorConfig,
     progress_callback: Callable[[str], None] | None = None,
+    comparison_snapshots: Sequence[PartitionSnapshot] = (),
 ) -> ValidationResult:
-    """Execute the full parquet validation flow and return aggregated findings."""
+    """Execute one bounded parquet validation flow and return aggregated findings."""
     validate_runtime_config(config)
     result = ValidationResult()
     _progress("discovering parquet files", progress_callback)
@@ -57,8 +59,13 @@ def run_validation(
         )
         if snapshot is not None:
             result.reviewed_partitions.append(partition.label())
+            result.partition_snapshots.append(snapshot)
             snapshots.append(snapshot)
-    run_baseline_checks(snapshots, result)
+    run_baseline_checks(
+        snapshots,
+        result,
+        comparison_snapshots=comparison_snapshots,
+    )
     _progress("writing reports", progress_callback)
     write_reports(config, result)
     return result

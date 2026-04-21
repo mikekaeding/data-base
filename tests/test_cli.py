@@ -268,7 +268,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["blocked_day"], "2026-04-06")
             self.assertEqual(payload["reviewed_day_count"], 0)
 
-    def test_run_daily_returns_blocked_status_after_reviewing_earlier_day(
+    def test_run_daily_returns_validated_status_before_later_empty_day(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -294,10 +294,10 @@ class CliTests(unittest.TestCase):
                 with patch.object(sys, "argv", argv):
                     exit_code = main()
 
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 0)
             payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["status"], "blocked")
-            self.assertEqual(payload["blocked_day"], "2026-04-06")
+            self.assertEqual(payload["status"], "validated")
+            self.assertIsNone(payload["blocked_day"])
             self.assertEqual(payload["reviewed_day_count"], 1)
             self.assertEqual(payload["latest_reviewed_day"], "2026-04-05")
 
@@ -354,8 +354,8 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["reviewed_day_count"], 2)
-            self.assertEqual(payload["latest_reviewed_day"], "2026-04-08")
+            self.assertEqual(payload["reviewed_day_count"], 1)
+            self.assertEqual(payload["latest_reviewed_day"], "2026-04-07")
 
     def test_run_daily_uses_default_scheduled_configuration(self) -> None:
         with patch("flash_dataset.cli.run_scheduled") as run_scheduled:

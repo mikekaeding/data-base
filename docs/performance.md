@@ -18,12 +18,13 @@
   partition roots that overlap the selected window before collecting file paths.
 - Parse parquet paths first and open parquet footers only for files whose partition day falls
   inside the selected validation window.
-- For selected days, discover parquet files once and validate partition-by-partition.
+- For each selected day, discover parquet files once and validate partition-by-partition.
 - Read only the columns needed for the current rule group.
 - Reuse in-memory Arrow tables within one partition through the partition-table cache.
 - Use Arrow group-by, join, and filter operations for large count and key checks.
-- After partition-local validation, derive compact baseline snapshots and compare them across the
-  current run instead of rereading full partitions from scratch.
+- After partition-local validation, derive compact baseline snapshots and compare the current day
+  against committed snapshots from earlier reviewed days inside the active review window instead of
+  rereading full partitions from scratch.
 - Fall back to Python iteration only for small or inherently row-oriented contracts such as
   access-list grouping, authorization ordinal checks, and transaction RLP hash validation.
 
@@ -49,5 +50,5 @@
 - Partition validation remains correctness-first. Some semantic checks intentionally scan entire
   partition tables because partial sampling would weaken confidence in stored parquet correctness.
 - Drift warnings only fire when at least three healthy peer partitions for the same UTC hour are
-  present in the current run, which keeps the baseline layer self-contained and avoids inventing
-  unstable thresholds from one or two samples or from unlike hour buckets.
+  available from the active review window, which avoids inventing unstable thresholds from one or
+  two samples or from unlike hour buckets.

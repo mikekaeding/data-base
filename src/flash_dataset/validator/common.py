@@ -8,11 +8,15 @@ from dataclasses import dataclass
 from dataclasses import field
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
 from typing import cast
 
 import pyarrow as pa
+
+if TYPE_CHECKING:
+    from .baselines import PartitionSnapshot
 
 Severity = Literal["critical", "high", "medium", "low"]
 Status = Literal["fail", "warn", "metric"]
@@ -39,6 +43,11 @@ def _empty_partition_labels() -> list[str]:
 def _empty_rule_counts() -> dict[str, int]:
     """Return one empty integer counter map for rule counts."""
     return {}
+
+
+def _empty_partition_snapshots() -> list[PartitionSnapshot]:
+    """Return one empty partition-snapshot list with a precise element type."""
+    return []
 
 
 def _empty_status_counts() -> dict[Status, int]:
@@ -255,6 +264,9 @@ class ValidationResult:
     findings: list[Finding] = field(default_factory=_empty_findings)
     scanned_files: int = 0
     scanned_rows: int = 0
+    partition_snapshots: list[PartitionSnapshot] = field(
+        default_factory=_empty_partition_snapshots
+    )
     reviewed_partitions: list[str] = field(default_factory=_empty_partition_labels)
     rule_counts: dict[str, int] = field(default_factory=_empty_rule_counts)
     examples_per_rule: dict[str, int] = field(default_factory=_empty_rule_counts)

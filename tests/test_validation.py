@@ -48,7 +48,7 @@ class ValidationTests(unittest.TestCase):
         empty_summary = DistributionSummary(0, None, None, None)
         return PartitionSnapshot(
             partition=PartitionIdentity(current_day, 16),
-            dataset_entries=(),
+            dataset_snapshots=(),
             empty_datasets=(),
             payload_lengths=payload_lengths,
             payload_length_summary=cls._distribution_summary(payload_lengths),

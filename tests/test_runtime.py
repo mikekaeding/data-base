@@ -10,6 +10,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import textwrap
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -21,6 +22,7 @@ from flash_dataset.runtime import run_once
 from flash_dataset.runtime import run_scheduled
 from flash_dataset.runtime import RuntimeConfig
 
+from tests.helpers import append_payload_variant
 from tests.helpers import valid_day_tables
 from tests.helpers import write_day_tables
 
@@ -39,7 +41,7 @@ class RuntimeTests(unittest.TestCase):
                 ["2026-04-05", "2026-04-06"],
             )
 
-    def test_run_once_updates_watermark_to_latest_reviewable_day(self) -> None:
+    def test_run_once_updates_watermark_to_next_reviewable_day(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "storage"
             working_directory = Path(directory) / "runtime"
@@ -55,17 +57,33 @@ class RuntimeTests(unittest.TestCase):
             )
 
             self.assertEqual(summary.status, "validated")
-            self.assertEqual(summary.reviewed_day_count, 2)
-            self.assertEqual(summary.latest_reviewed_day, "2026-04-06")
+            self.assertEqual(summary.reviewed_day_count, 1)
+            self.assertEqual(summary.latest_reviewed_day, "2026-04-05")
             self.assertEqual(
                 (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
-                "2026-04-06\n",
+                "2026-04-05\n",
             )
             self.assertTrue(
                 (working_directory / "reports" / "latest" / "summary.md").is_file()
             )
             self.assertTrue(
                 (working_directory / "reports" / "latest" / "findings.jsonl").is_file()
+            )
+
+            second_summary = run_once(
+                RuntimeConfig(
+                    working_directory=working_directory,
+                    storage_directory=root,
+                    max_days_back=1,
+                )
+            )
+
+            self.assertEqual(second_summary.status, "validated")
+            self.assertEqual(second_summary.reviewed_day_count, 1)
+            self.assertEqual(second_summary.latest_reviewed_day, "2026-04-06")
+            self.assertEqual(
+                (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
+                "2026-04-06\n",
             )
 
     def test_run_once_rejects_date_partition_storage_for_runtime(self) -> None:
@@ -205,12 +223,25 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(summary.status, "blocked")
-            self.assertEqual(summary.blocked_day, "2026-04-06")
+            self.assertEqual(summary.status, "validated")
+            self.assertIsNone(summary.blocked_day)
             self.assertEqual(summary.pending_day_count, 2)
             self.assertEqual(summary.reviewed_day_count, 1)
             self.assertEqual(summary.latest_reviewed_day, "2026-04-05")
-            self.assertEqual(summary.exit_code(), 1)
+            self.assertEqual(summary.exit_code(), 0)
+
+            blocked_summary = run_once(
+                RuntimeConfig(
+                    working_directory=working_directory,
+                    storage_directory=root,
+                    max_days_back=1,
+                )
+            )
+
+            self.assertEqual(blocked_summary.status, "blocked")
+            self.assertEqual(blocked_summary.blocked_day, "2026-04-06")
+            self.assertEqual(blocked_summary.latest_reviewed_day, "2026-04-05")
+            self.assertEqual(blocked_summary.exit_code(), 1)
 
     def test_run_once_stops_before_later_day_when_earlier_pending_day_is_empty(
         self,
@@ -541,8 +572,20 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(second_summary.status, "validated")
             self.assertIsNone(second_summary.blocked_day)
-            self.assertEqual(second_summary.reviewed_day_count, 2)
-            self.assertEqual(second_summary.latest_reviewed_day, "2026-04-07")
+            self.assertEqual(second_summary.reviewed_day_count, 1)
+            self.assertEqual(second_summary.latest_reviewed_day, "2026-04-06")
+
+            third_summary = run_once(
+                RuntimeConfig(
+                    working_directory=working_directory,
+                    storage_directory=root,
+                )
+            )
+
+            self.assertEqual(third_summary.status, "validated")
+            self.assertIsNone(third_summary.blocked_day)
+            self.assertEqual(third_summary.reviewed_day_count, 1)
+            self.assertEqual(third_summary.latest_reviewed_day, "2026-04-07")
 
     def test_run_once_does_not_store_watermark_when_day_has_only_parse_warnings(
         self,
@@ -760,11 +803,11 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(summary.status, "validated")
             self.assertIsNone(summary.blocked_day)
-            self.assertEqual(summary.reviewed_day_count, 3)
-            self.assertEqual(summary.latest_reviewed_day, "2026-04-10")
+            self.assertEqual(summary.reviewed_day_count, 1)
+            self.assertEqual(summary.latest_reviewed_day, "2026-04-08")
             self.assertEqual(
                 (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
-                "2026-04-10\n",
+                "2026-04-08\n",
             )
 
     def test_run_once_ignores_days_older_than_max_days_back(self) -> None:
@@ -787,12 +830,72 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(summary.status, "validated")
             self.assertIsNone(summary.blocked_day)
             self.assertEqual(summary.pending_day_count, 2)
-            self.assertEqual(summary.reviewed_day_count, 2)
-            self.assertEqual(summary.latest_reviewed_day, "2026-04-08")
+            self.assertEqual(summary.reviewed_day_count, 1)
+            self.assertEqual(summary.latest_reviewed_day, "2026-04-07")
             self.assertEqual(
                 (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
-                "2026-04-08\n",
+                "2026-04-07\n",
             )
+
+    def test_run_once_uses_committed_baseline_snapshots_for_drift_checks(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "storage"
+            working_directory = Path(directory) / "runtime"
+            for day_number in (5, 6, 7):
+                write_day_tables(root, date(2026, 4, day_number), layout="hour")
+            anomalous_tables = valid_day_tables(date(2026, 4, 8))
+            for payload_seed in (2, 3, 4):
+                append_payload_variant(
+                    anomalous_tables,
+                    new_payload_seed=payload_seed,
+                    new_block_number=100 + payload_seed,
+                )
+            write_day_tables(
+                root,
+                date(2026, 4, 8),
+                layout="hour",
+                tables=anomalous_tables,
+            )
+
+            first_summary = run_once(
+                RuntimeConfig(
+                    working_directory=working_directory,
+                    storage_directory=root,
+                    max_days_back=3,
+                )
+            )
+            second_summary = run_once(
+                RuntimeConfig(
+                    working_directory=working_directory,
+                    storage_directory=root,
+                    max_days_back=3,
+                )
+            )
+            third_summary = run_once(
+                RuntimeConfig(
+                    working_directory=working_directory,
+                    storage_directory=root,
+                    max_days_back=3,
+                )
+            )
+            fourth_summary = run_once(
+                RuntimeConfig(
+                    working_directory=working_directory,
+                    storage_directory=root,
+                    max_days_back=3,
+                )
+            )
+
+            self.assertEqual(first_summary.latest_reviewed_day, "2026-04-05")
+            self.assertEqual(second_summary.latest_reviewed_day, "2026-04-06")
+            self.assertEqual(third_summary.latest_reviewed_day, "2026-04-07")
+            self.assertEqual(fourth_summary.status, "blocked")
+            self.assertEqual(fourth_summary.blocked_day, "2026-04-08")
+            self.assertEqual(fourth_summary.latest_reviewed_day, "2026-04-07")
+            self.assertIn("dataset_physical_drift", fourth_summary.rule_counts)
+            self.assertGreater(fourth_summary.warn_count, 0)
 
     def test_next_scheduled_run_rolls_forward_after_today_slot(self) -> None:
         run_at = parse_daily_utc_time("2:30AM")
@@ -1035,6 +1138,56 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(sleep_calls, [])
             self.assertEqual(run_once_times, [started_at])
             self.assertEqual(emitted_summaries, [{"status": "validated"}])
+
+    def test_run_scheduled_drains_validated_days_before_sleep(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "storage"
+            working_directory = Path(directory) / "runtime"
+            write_day_tables(root, date(2026, 4, 5), layout="hour")
+            started_at = datetime(2026, 4, 13, 7, 0, tzinfo=UTC)
+            sleep_calls: list[float] = []
+            emitted_statuses: list[str] = []
+            run_once_times: list[datetime | None] = []
+            run_once_summaries = iter(
+                [
+                    "validated",
+                    "validated",
+                    "idle",
+                ]
+            )
+
+            def record_sleep(seconds: float) -> None:
+                sleep_calls.append(seconds)
+
+            def record_summary(summary: object) -> None:
+                status = getattr(summary, "status")
+                emitted_statuses.append(status)
+                if status == "idle":
+                    raise StopIteration
+
+            def fake_run_once(
+                config: RuntimeConfig, run_time: datetime | None = None
+            ) -> object:
+                self.assertEqual(config.working_directory, working_directory)
+                self.assertEqual(config.storage_directory, root)
+                run_once_times.append(run_time)
+                return SimpleNamespace(status=next(run_once_summaries))
+
+            with patch("flash_dataset.runtime.run_once", side_effect=fake_run_once):
+                with self.assertRaises(StopIteration):
+                    run_scheduled(
+                        RuntimeConfig(
+                            working_directory=working_directory,
+                            storage_directory=root,
+                        ),
+                        emit_summary=record_summary,
+                        sleep=record_sleep,
+                        now_provider=lambda: started_at,
+                    )
+
+            self.assertEqual(sleep_calls, [])
+            self.assertEqual(run_once_times, [started_at, started_at, started_at])
+            self.assertEqual(emitted_statuses, ["validated", "validated", "idle"])
 
 
 if __name__ == "__main__":
