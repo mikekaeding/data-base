@@ -7,11 +7,11 @@
   layout, instead of sleeping first and surfacing the problem only at the next run slot.
 - If the process restarts after the configured UTC slot, run the pending daily pass immediately
   instead of idling until tomorrow and stretching backlog latency by almost a full day.
-- Skip days at or before the stored watermark without opening their parquet data.
+- Skip in-window days already listed in `reviewed-days.json` without opening their parquet data.
 - Bound the candidate scan to the newest discovered day and ignore folders older than
   `max_days_back` relative to that newest day.
-- Stop candidate selection at the first missing or empty later day so the single-day watermark
-  never advances past an earlier gap.
+- Keep missing days out of the candidate list entirely, and scan forward past empty day folders so
+  later completed days in the same window can still run.
 - Keep malformed in-range storage paths visible to discovery while pruning only valid out-of-range
   subtrees; otherwise filtered runs can hide parse warnings behind false `no_matching` results.
 - For date-bounded runs, prune discovery to only the supported `date=...` or `year/month/day`

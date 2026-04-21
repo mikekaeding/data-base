@@ -7,26 +7,25 @@
 - Base-only fields belong exclusively to `index == 0`. Treat that as a first-class invariant.
 - A `flashblocks` row does not need every `received_time_*` column populated. The useful invariant
   is that at least one source timestamp exists.
-- A simple day watermark is operationally cheap and easy to reason about, but it only works well
-  when data arrives in new `year/month/day` folders instead of mutating older days.
-- With only one stored day watermark, correctness depends on monotonic coverage: do not advance
-  past an earlier pending day that is missing or still has no parquet, and do not advance after a
-  failed run.
-- A day directory being non-empty is not enough to advance a day watermark. Only advance through
-  days that actually produced reviewed validator partitions.
-- The first watermark is special. Without prior state, you can validate available days
-  immediately, but you should not persist a latest-reviewed day until the reviewed run reaches the
-  oldest day inside the active review window.
+- A single day watermark is not enough once review order can skip gaps. Persist the set of already
+  reviewed days separately so a later-arriving gap day can still be picked up without reopening
+  every newer day.
+- Missing day folders should not stall later completed days in the same review window. Treat
+  missing days as absent work, not as a hard stop.
+- Empty discovered day folders should only block when they are the only unreviewed in-window work
+  left. If a later day is complete, review it now and come back to the empty day later.
+- Persist initial review state immediately after the first completed runtime pass. Delaying the
+  first state write makes later gap handling and restart behavior harder to reason about.
 - Runtime filesystem errors must fail closed. An unreadable mount or unreadable state file should
   never look like an idle run or an empty day.
 - An incremental scheduler must reject unsupported storage layouts up front. If the runtime only
   understands `year/month/day`, anything outside that strict root contract should be a
   configuration error, not a silent idle run. That includes stray top-level files, not just
   unexpected directories.
-- Day-level runtime progress must be stricter than partition-level review. If any non-metric
-  finding lands in a selected day, that day is still blocking runtime progress even when another
-  partition in the same day reviewed successfully. Report it as blocked so one-shot automation does
-  not treat a stalled watermark as success.
+- Day-level runtime progress should track day availability, not validator cleanliness. Once the
+  runtime selects a reviewable day and finishes that pass, later eligible days should stay
+  reviewable even if the validator reported warnings or failures for the selected day. Keep those
+  findings in the report and exit code instead of turning them into a stalled watermark.
 - Runtime reports must be owned by the runtime layer. If post-validation `summary.md` only reflects
   validator-local counts, operators lose the blocked/idle/validated state that explains whether the
   scheduler actually made progress.

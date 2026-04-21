@@ -33,7 +33,8 @@ The CLI exposes two commands:
 The `run-daily` command accepts five parameters:
 
 - `--working-directory PATH`
-  Writable directory for reports and the `latest-reviewed.txt` watermark.
+  Writable directory for reports plus runtime review state such as `latest-reviewed.txt` and
+  `reviewed-days.json`.
   Default: `/data/working`
 - `--storage-directory PATH`
   The parquet storage directory to scan.
@@ -84,8 +85,9 @@ Each `run-daily` pass prints one compact JSON summary to stdout and writes:
   first persisted watermark
 - `reports/latest/summary.md`
 - `reports/latest/findings.jsonl`
+- `reviewed-days.json` after the runtime establishes the first persisted review state
 - `baseline-snapshots.json` after the runtime establishes the first persisted watermark
-- `latest-reviewed.txt` after the runtime establishes the first contiguous day watermark
+- `latest-reviewed.txt` after the runtime establishes the first persisted review state
 
 under `--working-directory`. The `validate-parquet` command writes reports to
 `--output-directory` without the runtime watermark.
@@ -94,30 +96,32 @@ validator finding counts. `findings.jsonl` remains the raw validator finding str
 
 If no newer day folders exist, the program writes a no-op report and exits successfully. Scheduled
 mode keeps running one-day passes until it reaches `idle` or `blocked`. The one-shot
-`run-daily --run-at off` path reports only the next expected day: it exits non-zero when that day
-is missing, empty, or has non-metric findings.
+`run-daily --run-at off` path reports only the next reviewable day: it exits non-zero when that day
+is missing, empty, or the validator emits fail findings for the selected day.
 
 ## Watermark Rules
 
 - The runtime layer discovers day partitions from `year=YYYY/month=MM/day=DD`.
+- `reviewed-days.json` stores every day that has already completed a runtime pass.
 - `latest-reviewed.txt` stores the newest reviewed day in ISO format such as `2026-04-13`.
-  That file does not exist until the runtime establishes the first persisted watermark.
+  Those files do not exist until the runtime completes its first review.
 - The runtime ignores day folders more than `--max-days-back` days older than the newest
   discovered folder.
-- Each runtime pass validates only the next expected day inside the active review window.
+- Each runtime pass validates the earliest unreviewed day inside the active review window that
+  currently contains parquet files.
 - Scheduled mode keeps invoking those single-day passes until there are no more unseen eligible
-  days in the window or the next expected day is blocked.
-- The watermark stops before the first missing or empty pending day so a later day cannot advance
-  past an earlier gap.
-- A one-shot runtime pass reports `blocked` when the next expected day is missing, empty, or has
-  any non-metric findings, even if another partition in that same day reviewed successfully.
-- On a fresh working directory, the runtime establishes the first watermark only after the
-  selected day reaches the oldest day inside the current review window.
+  days in the window or no remaining unreviewed day currently has parquet files.
+- Missing day folders do not block later completed days in the same window.
+- Empty discovered day folders do not block later completed days in the same window either, but if
+  only empty unreviewed days remain then the runtime reports `blocked`.
+- A one-shot runtime pass reports `blocked` only when unreviewed day folders exist in the active
+  window but none of them currently contain parquet files. Validator warnings and failures are
+  still reported for the selected day, but they do not stall runtime progress.
 - The runtime refuses an unreadable `latest-reviewed.txt`, unreadable storage folders, or a stored
-  watermark newer than the newest discovered day folder as configuration errors. A dangling
-  `latest-reviewed.txt` symlink is treated as corrupted runtime state, not as a fresh bootstrap.
-  Scheduled mode validates that runtime state before its first sleep, so a bad watermark fails
-  fast at startup.
+  watermark newer than the newest discovered day folder as configuration errors. Dangling
+  `latest-reviewed.txt` or `reviewed-days.json` symlinks are treated as corrupted runtime state,
+  not as a fresh bootstrap. Scheduled mode validates that runtime state before its first sleep, so
+  bad state fails fast at startup.
 - The runtime also persists compact committed baseline snapshots beside the watermark so one-day
   runs can still compare the current day against prior healthy same-hour peers inside the active
   review window.
@@ -125,11 +129,11 @@ is missing, empty, or has non-metric findings.
   `year=YYYY/month=MM/day=DD`, including validator-only `date=...`, dataset-first, unknown
   top-level roots, unsupported top-level files, and malformed runtime partition directories,
   instead of misreporting them as idle.
-- The watermark advances only when that single-day validator run finishes without fail findings, the
-  day being stored produced at least one reviewed validator partition and no non-metric findings
-  across the day, and the runtime successfully promotes that run through the stable
-  `reports/latest/current -> reports/<run>/` pointer. The top-level `latest-reviewed.txt` resolves
-  through that same pointer, so the committed latest report and committed watermark move together.
+- After every selected day that completes a runtime pass, the runtime records that day in
+  `reviewed-days.json` and refreshes `latest-reviewed.txt` to the newest reviewed day. Validator
+  warnings and failures do not suppress that state update. The top-level state files still resolve
+  through the stable `reports/latest/current -> reports/<run>/` pointer, so the committed latest
+  report and committed runtime state move together.
 
 This is intentionally simple. If more files arrive later inside an already reviewed `day=DD`
 folder, that day is not revalidated automatically.

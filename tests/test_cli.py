@@ -153,7 +153,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(stdout.getvalue(), "")
             self.assertIn("unsupported top-level entry", stderr.getvalue())
 
-    def test_run_daily_returns_blocked_status_for_parse_warning_only_day(
+    def test_run_daily_returns_validated_status_for_parse_warning_only_day(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -187,14 +187,15 @@ class CliTests(unittest.TestCase):
                 with patch.object(sys, "argv", argv):
                     exit_code = main()
 
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 0)
             payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["status"], "blocked")
-            self.assertEqual(payload["blocked_day"], "2026-04-05")
+            self.assertEqual(payload["status"], "validated")
+            self.assertIsNone(payload["blocked_day"])
+            self.assertEqual(payload["latest_reviewed_day"], "2026-04-05")
             self.assertEqual(payload["reviewed_day_count"], 0)
             self.assertEqual(payload["warn_count"], 1)
 
-    def test_run_daily_blocks_day_when_another_partition_in_same_day_fails(
+    def test_run_daily_reports_failure_when_another_partition_in_same_day_fails(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -229,10 +230,10 @@ class CliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 1)
             payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["status"], "blocked")
-            self.assertEqual(payload["blocked_day"], "2026-04-05")
+            self.assertEqual(payload["status"], "validated")
+            self.assertIsNone(payload["blocked_day"])
             self.assertEqual(payload["fail_count"], 1)
-            self.assertIsNone(payload["latest_reviewed_day"])
+            self.assertEqual(payload["latest_reviewed_day"], "2026-04-05")
 
     def test_run_daily_returns_blocked_status_when_earlier_pending_day_is_empty(
         self,
@@ -262,11 +263,47 @@ class CliTests(unittest.TestCase):
                 with patch.object(sys, "argv", argv):
                     exit_code = main()
 
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 0)
             payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["status"], "blocked")
-            self.assertEqual(payload["blocked_day"], "2026-04-06")
-            self.assertEqual(payload["reviewed_day_count"], 0)
+            self.assertEqual(payload["status"], "validated")
+            self.assertIsNone(payload["blocked_day"])
+            self.assertEqual(payload["reviewed_day_count"], 1)
+            self.assertEqual(payload["latest_reviewed_day"], "2026-04-07")
+
+    def test_run_daily_skips_earlier_empty_day_when_later_day_is_reviewable(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "storage"
+            working_directory = Path(directory) / "runtime"
+            write_day_tables(root, date(2026, 4, 7), layout="hour")
+            empty_day = root / "year=2026" / "month=04" / "day=06"
+            empty_day.mkdir(parents=True, exist_ok=True)
+            (working_directory / "latest-reviewed.txt").parent.mkdir(parents=True)
+            (working_directory / "latest-reviewed.txt").write_text(
+                "2026-04-05\n", encoding="utf-8"
+            )
+            stdout = StringIO()
+            argv = [
+                "flash-dataset",
+                RUN_DAILY_COMMAND,
+                "--working-directory",
+                str(working_directory),
+                "--storage-directory",
+                str(root),
+                "--run-at",
+                RUN_ONCE_TOKEN,
+            ]
+            with contextlib.redirect_stdout(stdout):
+                with patch.object(sys, "argv", argv):
+                    exit_code = main()
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["status"], "validated")
+            self.assertIsNone(payload["blocked_day"])
+            self.assertEqual(payload["reviewed_day_count"], 1)
+            self.assertEqual(payload["latest_reviewed_day"], "2026-04-07")
 
     def test_run_daily_returns_validated_status_before_later_empty_day(
         self,

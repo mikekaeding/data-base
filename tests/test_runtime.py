@@ -243,7 +243,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(blocked_summary.latest_reviewed_day, "2026-04-05")
             self.assertEqual(blocked_summary.exit_code(), 1)
 
-    def test_run_once_stops_before_later_day_when_earlier_pending_day_is_empty(
+    def test_run_once_reviews_later_day_when_earlier_pending_day_is_empty(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -264,23 +264,17 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(summary.status, "blocked")
-            self.assertEqual(summary.blocked_day, "2026-04-06")
+            self.assertEqual(summary.status, "validated")
+            self.assertIsNone(summary.blocked_day)
             self.assertEqual(summary.pending_day_count, 2)
-            self.assertEqual(summary.reviewed_day_count, 0)
-            self.assertEqual(summary.latest_reviewed_day, "2026-04-05")
+            self.assertEqual(summary.reviewed_day_count, 1)
+            self.assertEqual(summary.latest_reviewed_day, "2026-04-07")
             self.assertEqual(
                 (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
-                "2026-04-05\n",
-            )
-            self.assertIn(
-                "blocked by an earlier pending day",
-                (Path(summary.report_directory) / "summary.md").read_text(
-                    encoding="utf-8"
-                ),
+                "2026-04-07\n",
             )
 
-    def test_run_once_does_not_advance_watermark_when_validation_fails(self) -> None:
+    def test_run_once_advances_watermark_when_validation_fails(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "storage"
             working_directory = Path(directory) / "runtime"
@@ -300,14 +294,14 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(summary.status, "blocked")
-            self.assertEqual(summary.blocked_day, "2026-04-06")
+            self.assertEqual(summary.status, "validated")
+            self.assertIsNone(summary.blocked_day)
             self.assertTrue(summary.has_failures)
             self.assertEqual(summary.reviewed_day_count, 0)
-            self.assertEqual(summary.latest_reviewed_day, "2026-04-05")
+            self.assertEqual(summary.latest_reviewed_day, "2026-04-06")
             self.assertEqual(
                 (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
-                "2026-04-05\n",
+                "2026-04-06\n",
             )
             self.assertTrue((Path(summary.report_directory) / "summary.md").is_file())
 
@@ -537,7 +531,7 @@ class RuntimeTests(unittest.TestCase):
                 "2026-04-05\n",
             )
 
-    def test_run_once_waits_for_missing_next_day_before_advancing_watermark(
+    def test_run_once_reviews_later_day_before_missing_gap_and_revisits_gap_later(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -556,12 +550,14 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(first_summary.status, "blocked")
-            self.assertEqual(first_summary.blocked_day, "2026-04-06")
-            self.assertEqual(first_summary.reviewed_day_count, 0)
-            self.assertEqual(first_summary.latest_reviewed_day, "2026-04-05")
-
-            write_day_tables(root, date(2026, 4, 6), layout="hour")
+            self.assertEqual(first_summary.status, "validated")
+            self.assertIsNone(first_summary.blocked_day)
+            self.assertEqual(first_summary.reviewed_day_count, 1)
+            self.assertEqual(first_summary.latest_reviewed_day, "2026-04-07")
+            self.assertEqual(
+                (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
+                "2026-04-07\n",
+            )
 
             second_summary = run_once(
                 RuntimeConfig(
@@ -570,10 +566,12 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(second_summary.status, "validated")
+            self.assertEqual(second_summary.status, "idle")
             self.assertIsNone(second_summary.blocked_day)
-            self.assertEqual(second_summary.reviewed_day_count, 1)
-            self.assertEqual(second_summary.latest_reviewed_day, "2026-04-06")
+            self.assertEqual(second_summary.reviewed_day_count, 0)
+            self.assertEqual(second_summary.latest_reviewed_day, "2026-04-07")
+
+            write_day_tables(root, date(2026, 4, 6), layout="hour")
 
             third_summary = run_once(
                 RuntimeConfig(
@@ -587,7 +585,43 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(third_summary.reviewed_day_count, 1)
             self.assertEqual(third_summary.latest_reviewed_day, "2026-04-07")
 
-    def test_run_once_does_not_store_watermark_when_day_has_only_parse_warnings(
+    def test_run_once_reviews_later_day_before_earlier_empty_day(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "storage"
+            working_directory = Path(directory) / "runtime"
+            write_day_tables(root, date(2026, 4, 7), layout="hour")
+            empty_day = root / "year=2026" / "month=04" / "day=06"
+            empty_day.mkdir(parents=True, exist_ok=True)
+            working_directory.mkdir(parents=True, exist_ok=True)
+            (working_directory / "latest-reviewed.txt").write_text(
+                "2026-04-05\n", encoding="utf-8"
+            )
+
+            first_summary = run_once(
+                RuntimeConfig(
+                    working_directory=working_directory,
+                    storage_directory=root,
+                )
+            )
+
+            self.assertEqual(first_summary.status, "validated")
+            self.assertIsNone(first_summary.blocked_day)
+            self.assertEqual(first_summary.reviewed_day_count, 1)
+            self.assertEqual(first_summary.latest_reviewed_day, "2026-04-07")
+
+            second_summary = run_once(
+                RuntimeConfig(
+                    working_directory=working_directory,
+                    storage_directory=root,
+                )
+            )
+
+            self.assertEqual(second_summary.status, "blocked")
+            self.assertEqual(second_summary.blocked_day, "2026-04-06")
+            self.assertEqual(second_summary.reviewed_day_count, 0)
+            self.assertEqual(second_summary.latest_reviewed_day, "2026-04-07")
+
+    def test_run_once_stores_watermark_when_day_has_only_parse_warnings(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -613,32 +647,32 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(summary.status, "blocked")
-            self.assertEqual(summary.blocked_day, "2026-04-05")
+            self.assertEqual(summary.status, "validated")
+            self.assertIsNone(summary.blocked_day)
             self.assertEqual(summary.reviewed_day_count, 0)
             self.assertEqual(summary.reviewed_partition_count, 0)
             self.assertEqual(summary.warn_count, 1)
             self.assertEqual(summary.rule_counts, {"partition_parse_error": 1})
-            self.assertIsNone(summary.latest_reviewed_day)
-            self.assertEqual(summary.exit_code(), 1)
-            self.assertFalse((working_directory / "latest-reviewed.txt").exists())
+            self.assertEqual(summary.latest_reviewed_day, "2026-04-05")
+            self.assertEqual(summary.exit_code(), 0)
+            self.assertEqual(
+                (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
+                "2026-04-05\n",
+            )
             summary_text = (Path(summary.report_directory) / "summary.md").read_text(
                 encoding="utf-8"
             )
-            self.assertIn(
-                "- status: `blocked by a selected day that did not validate cleanly`",
-                summary_text,
-            )
-            self.assertIn("- blocked day: `2026-04-05`", summary_text)
+            self.assertIn("- status: `validated`", summary_text)
+            self.assertIn("- blocked day: `none`", summary_text)
             self.assertIn("- `partition_parse_error`: `1`", summary_text)
             self.assertIn(
-                "- status: `blocked by a selected day that did not validate cleanly`",
+                "- status: `validated`",
                 (working_directory / "reports" / "latest" / "summary.md").read_text(
                     encoding="utf-8"
                 ),
             )
 
-    def test_run_once_blocks_day_when_one_partition_warns_and_another_reviews(
+    def test_run_once_advances_day_when_one_partition_warns_and_another_reviews(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -665,15 +699,18 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(summary.status, "blocked")
-            self.assertEqual(summary.blocked_day, "2026-04-05")
+            self.assertEqual(summary.status, "validated")
+            self.assertIsNone(summary.blocked_day)
             self.assertEqual(summary.reviewed_day_count, 1)
             self.assertEqual(summary.reviewed_partition_count, 1)
             self.assertEqual(summary.warn_count, 1)
-            self.assertIsNone(summary.latest_reviewed_day)
-            self.assertFalse((working_directory / "latest-reviewed.txt").exists())
+            self.assertEqual(summary.latest_reviewed_day, "2026-04-05")
+            self.assertEqual(
+                (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
+                "2026-04-05\n",
+            )
 
-    def test_run_once_blocks_day_when_later_partition_in_same_day_fails(
+    def test_run_once_advances_day_when_later_partition_in_same_day_fails(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -698,16 +735,19 @@ class RuntimeTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(summary.status, "blocked")
-            self.assertEqual(summary.blocked_day, "2026-04-05")
+            self.assertEqual(summary.status, "validated")
+            self.assertIsNone(summary.blocked_day)
             self.assertTrue(summary.has_failures)
             self.assertEqual(summary.fail_count, 1)
             self.assertEqual(summary.reviewed_day_count, 1)
             self.assertEqual(summary.reviewed_partition_count, 1)
-            self.assertIsNone(summary.latest_reviewed_day)
-            self.assertFalse((working_directory / "latest-reviewed.txt").exists())
+            self.assertEqual(summary.latest_reviewed_day, "2026-04-05")
+            self.assertEqual(
+                (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
+                "2026-04-05\n",
+            )
 
-    def test_run_once_does_not_store_initial_watermark_before_window_start_exists(
+    def test_run_once_stores_initial_watermark_before_window_start_exists(
         self,
     ) -> None:
         with TemporaryDirectory() as directory:
@@ -725,13 +765,10 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(summary.status, "validated")
             self.assertIsNone(summary.blocked_day)
             self.assertEqual(summary.reviewed_day_count, 1)
-            self.assertIsNone(summary.latest_reviewed_day)
-            self.assertFalse((working_directory / "latest-reviewed.txt").exists())
-            self.assertFalse((working_directory / "latest-reviewed.txt").is_symlink())
-            self.assertFalse(
-                (
-                    working_directory / "reports" / "latest" / "latest-reviewed.txt"
-                ).exists()
+            self.assertEqual(summary.latest_reviewed_day, "2026-04-07")
+            self.assertEqual(
+                (working_directory / "latest-reviewed.txt").read_text(encoding="utf-8"),
+                "2026-04-07\n",
             )
 
     def test_run_once_rejects_dangling_latest_reviewed_symlink(self) -> None:
@@ -891,9 +928,9 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(first_summary.latest_reviewed_day, "2026-04-05")
             self.assertEqual(second_summary.latest_reviewed_day, "2026-04-06")
             self.assertEqual(third_summary.latest_reviewed_day, "2026-04-07")
-            self.assertEqual(fourth_summary.status, "blocked")
-            self.assertEqual(fourth_summary.blocked_day, "2026-04-08")
-            self.assertEqual(fourth_summary.latest_reviewed_day, "2026-04-07")
+            self.assertEqual(fourth_summary.status, "validated")
+            self.assertIsNone(fourth_summary.blocked_day)
+            self.assertEqual(fourth_summary.latest_reviewed_day, "2026-04-08")
             self.assertIn("dataset_physical_drift", fourth_summary.rule_counts)
             self.assertGreater(fourth_summary.warn_count, 0)
 

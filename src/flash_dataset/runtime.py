@@ -22,12 +22,12 @@ from .validator import run_validation
 from .validator.baselines import DatasetPhysicalSnapshot
 from .validator.baselines import DistributionSummary
 from .validator.baselines import PartitionSnapshot
-from .validator.common import Finding
 from .validator.common import PartitionIdentity
 from .validator.discovery import validate_writable_directory_target
 
 RUN_DIRECTORY_FORMAT = "%Y-%m-%dT%H-%M-%SZ"
 STATE_FILE_NAME = "latest-reviewed.txt"
+REVIEWED_DAYS_FILE_NAME = "reviewed-days.json"
 BASELINE_SNAPSHOTS_FILE_NAME = "baseline-snapshots.json"
 SUMMARY_FILE_NAME = "summary.md"
 FINDINGS_FILE_NAME = "findings.jsonl"
@@ -75,12 +75,12 @@ class RunSummary:
     """Application-level summary for one scheduled or one-shot run.
 
     Args:
-        status: Whether the run completed validation, is blocked by a missing or invalid selected day, or found no work.
+        status: Whether the run completed validation, is blocked because only empty unreviewed days remain, or found no work.
         working_directory: Writable runtime directory.
         storage_directory: Input parquet storage directory.
         report_directory: Output directory for this run's reports.
         blocked_day: First calendar day currently blocking progress, if any.
-        latest_reviewed_day: Latest persisted day watermark after the run, if any.
+        latest_reviewed_day: Newest persisted reviewed day after the run, if any.
         discovered_day_count: Total day directories found under the storage directory.
         pending_day_count: Day directories later than the stored watermark and within the review window.
         reviewed_day_count: Distinct day directories that yielded at least one reviewed validator partition.
@@ -183,18 +183,18 @@ def run_once(config: RuntimeConfig, run_time: datetime | None = None) -> RunSumm
     run_time = _utc_now() if run_time is None else _as_utc(run_time)
     (
         state_path,
+        reviewed_days_path,
         baseline_snapshots_path,
         stored_watermark,
+        reviewed_days,
         committed_snapshots,
         discovered_days,
     ) = _load_runtime_state(config)
     oldest_allowed_day = _oldest_allowed_day(discovered_days, config.max_days_back)
     pending_days = _select_pending_days(
-        discovered_days, stored_watermark, oldest_allowed_day
+        discovered_days, reviewed_days, oldest_allowed_day
     )
-    target_day, blocked_day = _select_next_reviewable_day(
-        pending_days, stored_watermark, oldest_allowed_day
-    )
+    target_day, blocked_day = _select_next_reviewable_day(pending_days)
     persisted_snapshots = _pruned_committed_snapshots(
         committed_snapshots,
         oldest_allowed_day,
@@ -227,17 +227,16 @@ def run_once(config: RuntimeConfig, run_time: datetime | None = None) -> RunSumm
             summary,
             latest_directory=config.working_directory / "reports" / "latest",
             state_path=state_path,
+            reviewed_days_path=reviewed_days_path,
             baseline_snapshots_path=baseline_snapshots_path,
             persisted_watermark=stored_watermark,
+            persisted_reviewed_days=reviewed_days,
             persisted_snapshots=persisted_snapshots,
-            status_text=_runtime_status_text(
-                summary.status, blocked_by_pending_day=blocked_day is not None
-            ),
+            status_text=_runtime_status_text(summary.status),
             write_empty_findings=True,
         )
         return summary
 
-    blocked_by_pending_day = blocked_day is not None
     result = run_validation(
         ValidatorConfig(
             storage_root=config.storage_directory,
@@ -254,37 +253,27 @@ def run_once(config: RuntimeConfig, run_time: datetime | None = None) -> RunSumm
     )
     counts = result.finding_counts_by_status()
     reviewed_partition_dates = _reviewed_partition_dates(result.reviewed_partitions)
-    issue_dates = _issue_dates(result.findings, config.storage_directory)
-    reviewed_watermark_days = _contiguous_reviewed_days(
-        [target_day],
-        reviewed_partition_dates,
-        issue_dates,
+    persisted_reviewed_days = _next_reviewed_days(
+        reviewed_days,
+        target_day.partition_date,
     )
-    blocked_day = _blocked_day_after_validation(
-        [target_day],
-        reviewed_watermark_days,
-        blocked_day,
+    persisted_watermark = _next_latest_reviewed_day(
+        stored_watermark,
+        target_day.partition_date,
     )
-    persisted_watermark = stored_watermark
-    if not result.has_failures() and _should_store_latest_reviewed_day(
-        stored_watermark, reviewed_watermark_days, oldest_allowed_day
-    ):
-        persisted_watermark = reviewed_watermark_days[-1].partition_date
-        persisted_snapshots = _next_committed_snapshots(
-            persisted_snapshots,
-            result.partition_snapshots,
-            oldest_allowed_day,
-            persisted_watermark,
-        )
+    persisted_snapshots = _next_committed_snapshots(
+        persisted_snapshots,
+        result.partition_snapshots,
+        oldest_allowed_day,
+        persisted_watermark,
+    )
     summary = RunSummary(
-        status="blocked" if blocked_day is not None else "validated",
+        status="validated",
         working_directory=str(config.working_directory),
         storage_directory=str(config.storage_directory),
         report_directory=str(report_directory),
-        blocked_day=None if blocked_day is None else blocked_day.isoformat(),
-        latest_reviewed_day=(
-            None if persisted_watermark is None else persisted_watermark.isoformat()
-        ),
+        blocked_day=None,
+        latest_reviewed_day=persisted_watermark.isoformat(),
         discovered_day_count=len(discovered_days),
         pending_day_count=len(pending_days),
         reviewed_day_count=len(reviewed_partition_dates),
@@ -299,12 +288,12 @@ def run_once(config: RuntimeConfig, run_time: datetime | None = None) -> RunSumm
         summary,
         latest_directory=config.working_directory / "reports" / "latest",
         state_path=state_path,
+        reviewed_days_path=reviewed_days_path,
         baseline_snapshots_path=baseline_snapshots_path,
         persisted_watermark=persisted_watermark,
+        persisted_reviewed_days=persisted_reviewed_days,
         persisted_snapshots=persisted_snapshots,
-        status_text=_runtime_status_text(
-            summary.status, blocked_by_pending_day=blocked_by_pending_day
-        ),
+        status_text=_runtime_status_text(summary.status),
         write_empty_findings=False,
     )
     return summary
@@ -344,8 +333,10 @@ def _finalize_run_outputs(
     summary: RunSummary,
     latest_directory: Path,
     state_path: Path,
+    reviewed_days_path: Path,
     baseline_snapshots_path: Path,
     persisted_watermark: date | None,
+    persisted_reviewed_days: set[date],
     persisted_snapshots: list[PartitionSnapshot],
     status_text: str,
     write_empty_findings: bool,
@@ -359,12 +350,14 @@ def _finalize_run_outputs(
     _write_report_state_files(
         report_directory,
         persisted_watermark,
+        persisted_reviewed_days,
         persisted_snapshots,
     )
     _promote_latest_report(
         report_directory,
         latest_directory,
         state_path,
+        reviewed_days_path,
         baseline_snapshots_path,
         has_persisted_watermark=persisted_watermark is not None,
     )
@@ -372,7 +365,15 @@ def _finalize_run_outputs(
 
 def _load_runtime_state(
     config: RuntimeConfig,
-) -> tuple[Path, Path, date | None, list[PartitionSnapshot], list[DayPartition]]:
+) -> tuple[
+    Path,
+    Path,
+    Path,
+    date | None,
+    set[date],
+    list[PartitionSnapshot],
+    list[DayPartition],
+]:
     try:
         config.working_directory.mkdir(parents=True, exist_ok=True)
     except OSError as error:
@@ -380,11 +381,23 @@ def _load_runtime_state(
             f"working directory is not writable: {config.working_directory}"
         ) from error
     state_path = config.working_directory / STATE_FILE_NAME
+    reviewed_days_path = config.working_directory / REVIEWED_DAYS_FILE_NAME
     baseline_snapshots_path = config.working_directory / BASELINE_SNAPSHOTS_FILE_NAME
     stored_watermark = load_latest_reviewed_day(state_path)
+    loaded_reviewed_days = _load_reviewed_days(reviewed_days_path)
     committed_snapshots = _load_committed_baseline_snapshots(baseline_snapshots_path)
     discovered_days = discover_day_partitions(config.storage_directory)
     _validate_stored_watermark(state_path, stored_watermark, discovered_days)
+    reviewed_days = _resolved_reviewed_days(
+        stored_watermark,
+        loaded_reviewed_days,
+        discovered_days,
+    )
+    _validate_reviewed_days(
+        reviewed_days_path,
+        stored_watermark,
+        loaded_reviewed_days,
+    )
     _validate_committed_snapshots(
         baseline_snapshots_path,
         stored_watermark,
@@ -392,8 +405,10 @@ def _load_runtime_state(
     )
     return (
         state_path,
+        reviewed_days_path,
         baseline_snapshots_path,
         stored_watermark,
+        reviewed_days,
         committed_snapshots,
         discovered_days,
     )
@@ -435,6 +450,62 @@ def store_latest_reviewed_day(state_path: Path, latest_reviewed_day: date) -> No
     except OSError as error:
         raise ValidatorConfigurationError(
             f"failed to write latest reviewed day: {state_path}"
+        ) from error
+
+
+def _load_reviewed_days(reviewed_days_path: Path) -> set[date] | None:
+    try:
+        raw_value = reviewed_days_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        if reviewed_days_path.is_symlink():
+            raise ValidatorConfigurationError(
+                f"reviewed days are a dangling symlink: {reviewed_days_path}"
+            ) from None
+        return None
+    except OSError as error:
+        raise ValidatorConfigurationError(
+            f"failed to read reviewed days: {reviewed_days_path}"
+        ) from error
+    if raw_value == "":
+        return set()
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise ValidatorConfigurationError(
+            f"invalid reviewed days in {reviewed_days_path}"
+        ) from error
+    if not isinstance(payload, list):
+        raise ValidatorConfigurationError(
+            f"invalid reviewed days in {reviewed_days_path}"
+        )
+    reviewed_days: set[date] = set()
+    for item in cast(list[object], payload):
+        if not isinstance(item, str):
+            raise ValidatorConfigurationError(
+                f"invalid reviewed days in {reviewed_days_path}"
+            )
+        try:
+            reviewed_days.add(date.fromisoformat(item))
+        except ValueError as error:
+            raise ValidatorConfigurationError(
+                f"invalid reviewed days in {reviewed_days_path}"
+            ) from error
+    return reviewed_days
+
+
+def _store_reviewed_days(reviewed_days_path: Path, reviewed_days: set[date]) -> None:
+    try:
+        reviewed_days_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = reviewed_days_path.with_name(f"{reviewed_days_path.name}.tmp")
+        payload = [reviewed_day.isoformat() for reviewed_day in sorted(reviewed_days)]
+        temporary_path.write_text(
+            f"{json.dumps(payload, sort_keys=True)}\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(reviewed_days_path)
+    except OSError as error:
+        raise ValidatorConfigurationError(
+            f"failed to write reviewed days: {reviewed_days_path}"
         ) from error
 
 
@@ -850,7 +921,7 @@ def _day_contains_parquet_files(partition: DayPartition) -> bool:
 
 def _select_pending_days(
     discovered_days: list[DayPartition],
-    stored_watermark: date | None,
+    reviewed_days: set[date],
     oldest_allowed_day: date | None,
 ) -> list[DayPartition]:
     if oldest_allowed_day is None:
@@ -859,7 +930,7 @@ def _select_pending_days(
         partition
         for partition in discovered_days
         if partition.partition_date >= oldest_allowed_day
-        and (stored_watermark is None or partition.partition_date > stored_watermark)
+        and partition.partition_date not in reviewed_days
     ]
 
 
@@ -899,25 +970,45 @@ def _validate_committed_snapshots(
             )
 
 
+def _validate_reviewed_days(
+    reviewed_days_path: Path,
+    stored_watermark: date | None,
+    loaded_reviewed_days: set[date] | None,
+) -> None:
+    if loaded_reviewed_days is None:
+        return
+    if stored_watermark is None:
+        if loaded_reviewed_days:
+            raise ValidatorConfigurationError(
+                "reviewed days exist without a latest reviewed day: "
+                f"{reviewed_days_path}"
+            )
+        return
+    if not loaded_reviewed_days:
+        raise ValidatorConfigurationError(
+            "reviewed days are empty despite a latest reviewed day: "
+            f"{reviewed_days_path}"
+        )
+    if max(loaded_reviewed_days) != stored_watermark:
+        raise ValidatorConfigurationError(
+            "latest reviewed day does not match reviewed day state: "
+            f"{reviewed_days_path}"
+        )
+
+
 def _select_next_reviewable_day(
     pending_days: list[DayPartition],
-    stored_watermark: date | None,
-    oldest_allowed_day: date | None,
 ) -> tuple[DayPartition | None, date | None]:
     """Return the next reviewable day and the first day currently blocking progress."""
     if not pending_days:
         return None, None
-    expected_day = pending_days[0].partition_date
-    if stored_watermark is not None:
-        expected_day = stored_watermark + timedelta(days=1)
-    if oldest_allowed_day is not None and expected_day < oldest_allowed_day:
-        expected_day = oldest_allowed_day
-    first_pending_day = pending_days[0]
-    if first_pending_day.partition_date != expected_day:
-        return None, expected_day
-    if not _day_contains_parquet_files(first_pending_day):
-        return None, expected_day
-    return first_pending_day, None
+    blocked_day: date | None = None
+    for pending_day in pending_days:
+        if _day_contains_parquet_files(pending_day):
+            return pending_day, blocked_day
+        if blocked_day is None:
+            blocked_day = pending_day.partition_date
+    return None, blocked_day
 
 
 def _comparison_snapshots_for_target_day(
@@ -979,80 +1070,6 @@ def _reviewed_partition_dates(reviewed_partitions: list[str]) -> set[date]:
     }
 
 
-def _issue_dates(findings: list[Finding], storage_directory: Path) -> set[date]:
-    issue_dates: set[date] = set()
-    for finding in findings:
-        if finding.status == "metric":
-            continue
-        issue_date = _issue_date(finding, storage_directory)
-        if issue_date is not None:
-            issue_dates.add(issue_date)
-    return issue_dates
-
-
-def _issue_date(finding: Finding, storage_directory: Path) -> date | None:
-    if finding.day is not None:
-        return _parse_iso_day_prefix(finding.day)
-    if finding.partition is not None:
-        return _parse_iso_day_prefix(finding.partition)
-    if finding.file is None:
-        return None
-    return _runtime_file_day(Path(finding.file), storage_directory)
-
-
-def _parse_iso_day_prefix(value: str) -> date | None:
-    try:
-        return date.fromisoformat(value[:10])
-    except ValueError:
-        return None
-
-
-def _runtime_file_day(path: Path, storage_directory: Path) -> date | None:
-    try:
-        relative_parts = path.relative_to(storage_directory).parts
-    except ValueError:
-        return None
-    for index in range(len(relative_parts) - 2):
-        year = _parse_number_component(relative_parts[index], "year")
-        month = _parse_number_component(relative_parts[index + 1], "month")
-        day_number = _parse_number_component(relative_parts[index + 2], "day")
-        if year is None or month is None or day_number is None:
-            continue
-        try:
-            return date(year, month, day_number)
-        except ValueError:
-            return None
-    return None
-
-
-def _contiguous_reviewed_days(
-    reviewable_days: list[DayPartition],
-    reviewed_partition_dates: set[date],
-    issue_dates: set[date],
-) -> list[DayPartition]:
-    reviewed_days: list[DayPartition] = []
-    for partition in reviewable_days:
-        if (
-            partition.partition_date not in reviewed_partition_dates
-            or partition.partition_date in issue_dates
-        ):
-            return reviewed_days
-        reviewed_days.append(partition)
-    return reviewed_days
-
-
-def _blocked_day_after_validation(
-    reviewable_days: list[DayPartition],
-    reviewed_watermark_days: list[DayPartition],
-    blocked_day: date | None,
-) -> date | None:
-    if blocked_day is not None:
-        return blocked_day
-    if len(reviewed_watermark_days) < len(reviewable_days):
-        return reviewable_days[len(reviewed_watermark_days)].partition_date
-    return None
-
-
 def _oldest_allowed_day(
     discovered_days: list[DayPartition], max_days_back: int
 ) -> date | None:
@@ -1063,20 +1080,36 @@ def _oldest_allowed_day(
     return newest_discovered_day - timedelta(days=max_days_back)
 
 
-def _should_store_latest_reviewed_day(
+def _resolved_reviewed_days(
     stored_watermark: date | None,
-    reviewed_days: list[DayPartition],
-    oldest_allowed_day: date | None,
-) -> bool:
-    """Return whether this run can advance the persisted day watermark."""
-    if not reviewed_days:
-        return False
-    if stored_watermark is not None:
-        return True
-    return (
-        oldest_allowed_day is not None
-        and reviewed_days[0].partition_date == oldest_allowed_day
-    )
+    loaded_reviewed_days: set[date] | None,
+    discovered_days: list[DayPartition],
+) -> set[date]:
+    if loaded_reviewed_days is not None:
+        return set(loaded_reviewed_days)
+    if stored_watermark is None:
+        return set()
+    return {
+        partition.partition_date
+        for partition in discovered_days
+        if partition.partition_date <= stored_watermark
+    }
+
+
+def _next_reviewed_days(
+    reviewed_days: set[date],
+    reviewed_day: date,
+) -> set[date]:
+    return {*reviewed_days, reviewed_day}
+
+
+def _next_latest_reviewed_day(
+    stored_watermark: date | None,
+    reviewed_day: date,
+) -> date:
+    if stored_watermark is None:
+        return reviewed_day
+    return max(stored_watermark, reviewed_day)
 
 
 def _parse_number_component(name: str, prefix: str) -> int | None:
@@ -1091,11 +1124,16 @@ def _parse_number_component(name: str, prefix: str) -> int | None:
 def _write_report_state_files(
     report_directory: Path,
     persisted_watermark: date | None,
+    persisted_reviewed_days: set[date],
     persisted_snapshots: list[PartitionSnapshot],
 ) -> None:
     if persisted_watermark is None:
         return
     store_latest_reviewed_day(report_directory / STATE_FILE_NAME, persisted_watermark)
+    _store_reviewed_days(
+        report_directory / REVIEWED_DAYS_FILE_NAME,
+        persisted_reviewed_days,
+    )
     _store_committed_baseline_snapshots(
         report_directory / BASELINE_SNAPSHOTS_FILE_NAME,
         persisted_snapshots,
@@ -1106,6 +1144,7 @@ def _promote_latest_report(
     source_directory: Path,
     latest_directory: Path,
     state_path: Path,
+    reviewed_days_path: Path,
     baseline_snapshots_path: Path,
     has_persisted_watermark: bool,
 ) -> None:
@@ -1125,6 +1164,10 @@ def _promote_latest_report(
                 Path(LATEST_POINTER_NAME) / STATE_FILE_NAME,
             )
             _replace_symlink(
+                latest_directory / REVIEWED_DAYS_FILE_NAME,
+                Path(LATEST_POINTER_NAME) / REVIEWED_DAYS_FILE_NAME,
+            )
+            _replace_symlink(
                 latest_directory / BASELINE_SNAPSHOTS_FILE_NAME,
                 Path(LATEST_POINTER_NAME) / BASELINE_SNAPSHOTS_FILE_NAME,
             )
@@ -1133,13 +1176,19 @@ def _promote_latest_report(
                 Path("reports") / latest_directory.name / STATE_FILE_NAME,
             )
             _replace_symlink(
+                reviewed_days_path,
+                Path("reports") / latest_directory.name / REVIEWED_DAYS_FILE_NAME,
+            )
+            _replace_symlink(
                 baseline_snapshots_path,
                 Path("reports") / latest_directory.name / BASELINE_SNAPSHOTS_FILE_NAME,
             )
         else:
             _remove_path_if_present(latest_directory / STATE_FILE_NAME)
+            _remove_path_if_present(latest_directory / REVIEWED_DAYS_FILE_NAME)
             _remove_path_if_present(latest_directory / BASELINE_SNAPSHOTS_FILE_NAME)
             _remove_path_if_present(state_path)
+            _remove_path_if_present(reviewed_days_path)
             _remove_path_if_present(baseline_snapshots_path)
         _replace_symlink(
             latest_directory / LATEST_POINTER_NAME,
@@ -1172,16 +1221,12 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _runtime_status_text(
-    status: Literal["idle", "blocked", "validated"], blocked_by_pending_day: bool
-) -> str:
+def _runtime_status_text(status: Literal["idle", "blocked", "validated"]) -> str:
     if status == "idle":
         return "no new day partitions"
     if status == "validated":
         return "validated"
-    if blocked_by_pending_day:
-        return "blocked by an earlier pending day"
-    return "blocked by a selected day that did not validate cleanly"
+    return "blocked by an earlier pending day"
 
 
 def _write_runtime_report(

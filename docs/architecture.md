@@ -4,7 +4,7 @@
 
 `data-base` now has two layers:
 
-- an application runtime that owns daily scheduling, day-folder watermark state, and report
+- an application runtime that owns daily scheduling, reviewed-day state, and report
   directory management
 - the existing validator engine that owns parquet discovery, partition grouping, integrity checks,
   semantic checks, baselines, and report generation for one bounded validation run
@@ -18,7 +18,7 @@ at a time.
 - `flash_dataset/cli.py`
   Public CLI surface for `validate-parquet` and `run-daily` commands.
 - `flash_dataset/runtime.py`
-  Day-folder discovery, committed watermark and baseline-snapshot state management, no-op report
+  Day-folder discovery, reviewed-day and baseline-snapshot state management, no-op report
   generation, and the daily UTC scheduler.
 - `validator/common.py`
   Stable runtime types: config, findings, schema profiles, file index entries, and run result.
@@ -51,30 +51,32 @@ at a time.
 
 ## Core Invariants
 
-- The runtime watermark is one ISO day stored in `latest-reviewed.txt`.
+- The runtime persists reviewed-day state in `reviewed-days.json` and the newest reviewed day in
+  `latest-reviewed.txt`.
 - The runtime scheduler derives candidate work from `year=YYYY/month=MM/day=DD` folders.
 - The runtime rejects any storage tree that is not strict top-level `year/month/day`, including
   validator-only `date=...`, dataset-first, unknown top-level roots, unsupported top-level files,
   and malformed runtime partition directories, instead of treating them as idle/no-work states.
 - The runtime only considers day folders no more than `max_days_back` days older than the newest
   discovered day folder.
-- The runtime validates only the next expected day inside the active review window.
+- The runtime validates the earliest unreviewed day inside the active review window that currently
+  contains parquet files.
 - Scheduled mode drains later eligible days by repeating that single-day pass until it reaches
   `idle` or `blocked`.
-- The runtime emits `blocked` whenever later day folders are still blocked by the next expected day
-  being missing or empty, or when the selected day has any non-metric findings, even if another
-  partition in that same day reviewed successfully.
-- On a fresh working directory, the runtime only establishes the first watermark after the
-  selected day reaches the oldest day inside the current review window.
+- Missing day folders never block later completed days in the same window. Empty discovered day
+  folders only produce `blocked` once no later unreviewed day in the window currently has parquet
+  files. Validator warnings and failures stay attached to the selected day’s report, but they do
+  not stall later eligible days.
 - The runtime fails closed on unreadable storage directories, unreadable state files, or a stored
   watermark newer than the newest discovered day folder.
 - The runtime advances the committed report and committed watermark through one atomic pointer
   change. Each run directory stores its own `summary.md`, `findings.jsonl`,
-  `latest-reviewed.txt`, and `baseline-snapshots.json`, and `reports/latest/current` atomically
-  switches to the newest committed run. The top-level `latest-reviewed.txt` and
-  `baseline-snapshots.json` resolve through `reports/latest/*`, so a hard kill cannot leave the
-  committed report ahead of the committed runtime state or vice versa.
-  When no watermark has been persisted yet, the runtime leaves both state links absent instead of
+  `latest-reviewed.txt`, `reviewed-days.json`, and `baseline-snapshots.json`, and
+  `reports/latest/current` atomically switches to the newest committed run. The top-level
+  `latest-reviewed.txt`, `reviewed-days.json`, and `baseline-snapshots.json` resolve through
+  `reports/latest/*`, so a hard kill cannot leave the committed report ahead of the committed
+  runtime state or vice versa.
+  When no watermark has been persisted yet, the runtime leaves the top-level state links absent instead of
   publishing dangling symlinks, and any later dangling state link is treated as corruption.
 - Scheduled mode validates the same persisted watermark state before its first sleep, so corrupted
   runtime state fails fast at startup rather than waiting until the next run slot.
@@ -97,10 +99,11 @@ at a time.
 1. The runtime scans top-level `year/month/day` folders under the storage directory.
 2. The runtime fails fast if the storage tree is unreadable or does not expose the required
    top-level `year/month/day` layout for scheduled incremental review.
-3. The runtime loads `latest-reviewed.txt` and selects only later day folders that fall within
-   `max_days_back` of the newest discovered day.
-4. The runtime selects only the next expected day inside that review window, and it stops at the
-   first missing or empty pending day.
+3. The runtime loads `latest-reviewed.txt`, `reviewed-days.json`, and selects only day folders
+   within `max_days_back` of the newest discovered day.
+4. The runtime chooses the earliest unreviewed day in that window that currently has parquet
+   files. Missing days are skipped, and empty discovered days only block when no later in-window
+   day is reviewable.
 5. The runtime loads committed baseline snapshots for earlier reviewed days that still fall inside
    the same window.
 6. The runtime launches one validator run bounded to that single target day.
@@ -114,4 +117,5 @@ at a time.
 12. The validator writes `findings.jsonl` and one validator-local summary for the run.
 13. The runtime writes the final run `summary.md`, writes that run directory's committed runtime
     state files, and atomically flips `reports/latest/current` so `reports/latest/*`,
-    `latest-reviewed.txt`, and `baseline-snapshots.json` resolve to the same committed run.
+    `latest-reviewed.txt`, `reviewed-days.json`, and `baseline-snapshots.json` resolve to the same
+    committed run.
