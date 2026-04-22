@@ -37,7 +37,8 @@ The `run-daily` command accepts five parameters:
   `reviewed-days.json`.
   Default: `/data/working`
 - `--storage-directory PATH`
-  The parquet storage directory to scan.
+  The parquet storage directory to scan. A top-level `tmp/` subtree is ignored and reserved for
+  staged writer output.
   Default: `/data/storage`
 - `--run-at TIME`
   Daily UTC schedule in 12-hour format such as `6:00AM`. Set `off` to run once and exit.
@@ -126,9 +127,10 @@ is missing, empty, or the validator emits fail findings for the selected day.
   runs can still compare the current day against prior healthy same-hour peers inside the active
   review window.
 - The runtime also refuses any storage tree that is not strict top-level
-  `year=YYYY/month=MM/day=DD`, including validator-only `date=...`, dataset-first, unknown
-  top-level roots, unsupported top-level files, and malformed runtime partition directories,
-  instead of misreporting them as idle.
+  `year=YYYY/month=MM/day=DD`, with one reserved exception for a top-level `tmp/` staging
+  directory. Validator-only `date=...`, dataset-first, other unknown top-level roots, unsupported
+  top-level files, and malformed runtime partition directories are still rejected instead of
+  misreporting them as idle.
 - After every selected day that completes a runtime pass, the runtime records that day in
   `reviewed-days.json` and refreshes `latest-reviewed.txt` to the newest reviewed day. Validator
   warnings and failures do not suppress that state update. The top-level state files still resolve
@@ -207,10 +209,12 @@ docker build -t data-base:local .
   `year=YYYY/month=MM/day=DD/hour=HH/<dataset>_YYYY-MM-DD_HH.parquet`
 - fixture-friendly copied layout:
   `<dataset>/year=YYYY/month=MM/day=DD/<dataset>_YYYY-MM-DD.parquet`
+- a top-level `tmp/` subtree is ignored so external writers can stage files there safely
 
 `run-daily` is narrower: it requires the current strict top-level
-`year=YYYY/month=MM/day=DD` storage tree and fails fast on `date=...`, dataset-first, unknown
-top-level roots, or malformed runtime partition directories.
+`year=YYYY/month=MM/day=DD` storage tree, but it ignores one reserved top-level `tmp/` staging
+directory. It still fails fast on `date=...`, dataset-first, other unknown top-level roots, or
+malformed runtime partition directories.
 
 ## Development Checks
 

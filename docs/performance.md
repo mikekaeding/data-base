@@ -14,6 +14,8 @@
   later completed days in the same window can still run.
 - Keep malformed in-range storage paths visible to discovery while pruning only valid out-of-range
   subtrees; otherwise filtered runs can hide parse warnings behind false `no_matching` results.
+- Exclude the top-level storage `tmp/` staging subtree from recursive scans so in-progress writer
+  files do not consume validation work or trigger layout errors.
 - For date-bounded runs, prune discovery to only the supported `date=...` or `year/month/day`
   partition roots that overlap the selected window before collecting file paths.
 - Parse parquet paths first and open parquet footers only for files whose partition day falls

@@ -324,6 +324,28 @@ class DiscoveryTests(unittest.TestCase):
                 ["partition_parse_error"],
             )
 
+    def test_discover_files_ignores_top_level_tmp_directory(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_day_tables(root, date(2026, 4, 6), layout="hour")
+            write_day_tables(root / "tmp", date(2026, 4, 6), layout="hour")
+            config = ValidatorConfig(
+                storage_root=root,
+                output_directory=root / "reports",
+                date_from=None,
+                date_to=None,
+                verify_transaction_hashes=False,
+            )
+
+            result = ValidationResult()
+            entries = discover_files(config, result)
+
+            self.assertEqual(len(entries), 8)
+            self.assertEqual(result.findings, [])
+            self.assertTrue(
+                all(entry.path.relative_to(root).parts[0] != "tmp" for entry in entries)
+            )
+
     def test_discover_files_raises_when_storage_scan_is_unreadable(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

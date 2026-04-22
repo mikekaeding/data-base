@@ -23,6 +23,7 @@ from .validator.baselines import DatasetPhysicalSnapshot
 from .validator.baselines import DistributionSummary
 from .validator.baselines import PartitionSnapshot
 from .validator.common import PartitionIdentity
+from .validator.discovery import TEMPORARY_STORAGE_DIRECTORY_NAME
 from .validator.discovery import validate_writable_directory_target
 
 RUN_DIRECTORY_FORMAT = "%Y-%m-%dT%H-%M-%SZ"
@@ -816,6 +817,11 @@ def _validate_runtime_storage_layout(storage_directory: Path) -> None:
         "run-daily requires top-level year=YYYY/month=MM/day=DD storage layout"
     )
     for year_directory in _directory_entries(storage_directory):
+        if (
+            year_directory.is_dir()
+            and year_directory.name == TEMPORARY_STORAGE_DIRECTORY_NAME
+        ):
+            continue
         if not year_directory.is_dir():
             raise ValidatorConfigurationError(
                 f"{runtime_layout_message}: unsupported top-level entry {year_directory}"

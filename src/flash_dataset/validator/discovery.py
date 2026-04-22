@@ -25,6 +25,7 @@ DATE_FILE_RE = re.compile(r"^(?P<dataset>.+)_(?P<day>\d{4}-\d{2}-\d{2})\.parquet
 HOUR_FILE_RE = re.compile(
     r"^(?P<dataset>.+)_(?P<day>\d{4}-\d{2}-\d{2})_(?P<hour>\d{2})\.parquet$"
 )
+TEMPORARY_STORAGE_DIRECTORY_NAME = "tmp"
 
 
 def validate_runtime_config(config: ValidatorConfig) -> None:
@@ -91,6 +92,11 @@ def scan_parquet_paths(
         storage_root, topdown=True, onerror=onerror
     ):
         root_path = Path(root_str)
+        _prune_temporary_storage_directory(
+            storage_root,
+            root_path,
+            directory_names,
+        )
         if date_from is not None or date_to is not None:
             _prune_directory_names(
                 storage_root,
@@ -104,6 +110,18 @@ def scan_parquet_paths(
                 parquet_paths.append(root_path / file_name)
     parquet_paths.sort()
     return parquet_paths
+
+
+def _prune_temporary_storage_directory(
+    storage_root: Path,
+    root_path: Path,
+    directory_names: list[str],
+) -> None:
+    if root_path != storage_root:
+        return
+    directory_names[:] = [
+        name for name in directory_names if name != TEMPORARY_STORAGE_DIRECTORY_NAME
+    ]
 
 
 def _prune_directory_names(

@@ -54,9 +54,10 @@ at a time.
 - The runtime persists reviewed-day state in `reviewed-days.json` and the newest reviewed day in
   `latest-reviewed.txt`.
 - The runtime scheduler derives candidate work from `year=YYYY/month=MM/day=DD` folders.
-- The runtime rejects any storage tree that is not strict top-level `year/month/day`, including
-  validator-only `date=...`, dataset-first, unknown top-level roots, unsupported top-level files,
-  and malformed runtime partition directories, instead of treating them as idle/no-work states.
+- The runtime rejects any storage tree that is not top-level `year/month/day`, except for one
+  reserved top-level `tmp/` staging directory. Validator-only `date=...`, dataset-first, other
+  unknown top-level roots, unsupported top-level files, and malformed runtime partition
+  directories are still treated as configuration errors instead of idle/no-work states.
 - The runtime only considers day folders no more than `max_days_back` days older than the newest
   discovered day folder.
 - The runtime validates the earliest unreviewed day inside the active review window that currently
@@ -96,7 +97,8 @@ at a time.
 
 ## Data Flow
 
-1. The runtime scans top-level `year/month/day` folders under the storage directory.
+1. The runtime scans top-level `year/month/day` folders under the storage directory and ignores a
+   reserved top-level `tmp/` staging subtree.
 2. The runtime fails fast if the storage tree is unreadable or does not expose the required
    top-level `year/month/day` layout for scheduled incremental review.
 3. The runtime loads `latest-reviewed.txt`, `reviewed-days.json`, and selects only day folders
@@ -107,8 +109,9 @@ at a time.
 5. The runtime loads committed baseline snapshots for earlier reviewed days that still fall inside
    the same window.
 6. The runtime launches one validator run bounded to that single target day.
-7. The validator narrows discovery to matching partition roots when the run is date-bounded, then
-   collects parquet files under those roots.
+7. The validator narrows discovery to matching partition roots when the run is date-bounded, skips
+   the reserved top-level `tmp/` staging subtree, and then collects parquet files under the
+   remaining roots.
 8. The validator parses supported storage layouts and groups files by storage partition.
 9. The validator checks partition completeness, single-file cardinality, and per-file schema.
 10. The validator loads column-pruned Arrow tables for each partition.

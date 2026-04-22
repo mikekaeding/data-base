@@ -149,6 +149,25 @@ class RuntimeTests(unittest.TestCase):
                     )
                 )
 
+    def test_run_once_ignores_top_level_tmp_directory(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "storage"
+            working_directory = Path(directory) / "runtime"
+            write_day_tables(root, date(2026, 4, 5), layout="hour")
+            write_day_tables(root / "tmp", date(2026, 4, 5), layout="hour")
+
+            summary = run_once(
+                RuntimeConfig(
+                    working_directory=working_directory,
+                    storage_directory=root,
+                    max_days_back=0,
+                )
+            )
+
+            self.assertEqual(summary.status, "validated")
+            self.assertEqual(summary.reviewed_day_count, 1)
+            self.assertEqual(summary.latest_reviewed_day, "2026-04-05")
+
     def test_run_once_rejects_top_level_runtime_file(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory) / "storage"
